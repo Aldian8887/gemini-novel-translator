@@ -1,0 +1,6 @@
+--only-binary=:all:
+-c constraints.txt
+httpx==0.28.1
+lxml==6.1.1
+streamlit==1.63.0
+tzdata==2026.3
