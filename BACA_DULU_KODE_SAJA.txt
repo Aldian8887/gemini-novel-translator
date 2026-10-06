@@ -1,0 +1,22 @@
+PAKET KODE SAJA - v2.4.0
+
+Kode aplikasi, launcher dan daftar dependensi identik dengan versi 2.4.0.
+Paket ini tidak menyertakan lingkungan Python terpasang, workspace, EPUB,
+cache, checkpoint, progres pribadi, hasil terjemahan, maupun laporan audit
+buku pengguna. Tes pengembangan dan alat audit tidak disertakan dalam paket
+ringkas ini; paket lengkap sebelumnya tetap tersedia terpisah.
+
+CARA MENJALANKAN DI WINDOWS
+1. Ekstrak ke folder BARU, misalnya C:\GeminiTranslatorKosong.
+2. Pastikan Python 3.11-3.14 64-bit sudah terpasang.
+3. Jalankan MULAI_WINDOWS.bat. Koneksi internet diperlukan untuk pemasangan
+   dependensi pertama kali. Launcher membuat lingkungan Python lokal sendiri.
+4. Masukkan API key dan unggah EPUB untuk memulai progres baru.
+
+Folder kerja dan cache akan dibuat ketika aplikasi membutuhkannya.
+Jika file program disalin ke folder aplikasi lama, workspace yang sudah ada
+akan tetap terbaca. Paket ini tidak menghapus atau mereset data lama.
+
+README dan PATCH_NOTES asli dipertahankan sebagai dokumentasi versi lengkap;
+rujukan di sana ke snapshot workspace, tes dan laporan audit tidak disertakan
+dalam paket kode saja ini.
