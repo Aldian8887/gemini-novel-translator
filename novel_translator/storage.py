@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -89,6 +90,29 @@ def publish_file(staged: Path, destination: Path, overwrite=False, sleep=time.sl
             if attempt == 5:
                 raise
             sleep(min(0.8, 0.05 * 2**attempt))
+        except FileExistsError:
+            # G4 (T-GEMINI-4): no-clobber contract is preserved — an existing
+            # destination is never overwritten. Fallback below would clobber
+            # via os.replace, so this must stay a hard error.
+            raise
+        except OSError:
+            # G4 (T-GEMINI-4): filesystems without hardlink support (removable
+            # media, exFAT, etc.) raise e.g. EOPNOTSUPP/EPERM/EXDEV/EMLINK from
+            # os.link. Fall back to copy + atomic rename; atomicity is kept via
+            # the staged+rename pattern. No retry: re-linking cannot succeed.
+            fd, name = tempfile.mkstemp(prefix="." + destination.name + ".",
+                                        suffix=".copytmp", dir=destination.parent)
+            os.close(fd)
+            tmp_dest = Path(name)
+            try:
+                shutil.copyfile(staged, tmp_dest)
+                os.replace(tmp_dest, destination)
+            except BaseException:
+                tmp_dest.unlink(missing_ok=True)
+                raise
+            staged.unlink()
+            fsync_directory(destination.parent)
+            return
 
 
 def atomic_bytes(path: Path, data: bytes, overwrite=False):

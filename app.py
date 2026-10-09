@@ -4,6 +4,7 @@ import os
 import re
 import json
 import threading
+import html
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,9 +24,41 @@ from novel_translator.preferences import (checkpoints, load_preferences, save_pr
 ROOT = Path(__file__).resolve().parent
 WORKSPACE = Path(os.getenv("EPUB_TRANSLATOR_WORKSPACE", str(ROOT / "workspace"))).expanduser()
 
+# T-UI-1 Area 7: satu blok CSS polish (visual saja — tidak mengubah layout,
+# widget key, urutan konstruksi TranslationOptions, maupun logika job).
+# Mengonsolidasikan subset CSS Area 1 (superset penuh).
+_POLISH_CSS = """<style>
+.block-container { padding-top: 2rem; max-width: 46rem; }
+h1 { font-size: 2rem !important; font-weight: 700; }
+.app-subtitle { color: #6b7280; font-size: 0.95rem; margin-top: -0.75rem; }
+section[data-testid="stSidebar"] .block-container { padding-top: 1.5rem; }
+div[data-testid="stMetric"] { border: 1px solid #e5e7eb; border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem; }
+.stProgress > div > div { border-radius: 9999px; }
+.stCaption { color: #6b7280; }
+.footer-note { margin-top: 0.5rem; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+button[kind="primary"] { border-radius: 0.5rem; }
+</style>"""
+
 st.set_page_config(page_title="Translator EPUB", page_icon="📖", layout="centered")
+
+# T-UI-1 Area 7: injeksi CSS tepat setelah set_page_config. st.html ada sejak
+# Streamlit 1.33; fallback st.markdown bila versi lama (versi tidak di-pin di repo).
+if hasattr(st, "html"):
+    st.html(_POLISH_CSS)
+else:
+    st.markdown(_POLISH_CSS, unsafe_allow_html=True)
 st.title("EPUB Inggris → Indonesia")
 st.caption("Terjemahkan novel dengan format asli, progres tersimpan, dan API milikmu.")
+
+# T-UI-1 Area 1: identitas halaman (visual saja — tidak mengubah layout, widget key,
+# urutan konstruksi TranslationOptions, maupun logika job).
+st.markdown(
+    '<p class="app-subtitle">Jalur Gemini default · cache lokal · tanpa perubahan struktur EPUB.</p>',
+    unsafe_allow_html=True,
+)
 
 @st.cache_resource
 def job_registry():
@@ -72,6 +105,8 @@ with st.sidebar.expander("Lanjutkan checkpoint lama"):
                                   disabled=running)
         if st.button("Muat pengaturan checkpoint", disabled=running):
             restore_settings(checkpoint["settings"])
+            # T-UI-1 Area 5 (5c): umpan balik transien → toast.
+            st.toast("Pengaturan checkpoint dimuat.")
             st.rerun()
         st.caption("Memulihkan model, gaya, glossary dan instruksi persis. Unggah EPUB sumber yang sama untuk melanjutkan.")
     else:
@@ -83,8 +118,10 @@ with st.sidebar:
                                                    "openai": "OpenAI-compatible (gateway, mis. bansosai)"}[p],
                             help="Gateway OpenAI-compatible memakai key dan kuota terpisah dari Gemini; "
                                  "hasilnya tersimpan di cache terpisah dan tidak tercampur.")
+    # T-UI-1 Area 2 (2b): satu subheader zona kredensial menggantikan dua subheader
+    # per-provider; urutan widget dan key di dalam zona tidak berubah.
+    st.subheader("Kredensial & model")
     if provider == "openai":
-        st.subheader("Gateway OpenAI-compatible")
         base_url = st.text_input("Base URL gateway", value=DEFAULT_OA_BASE_URL, key="oa_base_url",
                                  disabled=running,
                                  help="Alamat basis API berakhiran /v1, mis. https://api.bansosai.app/v1. "
@@ -101,7 +138,6 @@ with st.sidebar:
                    "tetap berlaku sebagai rem pengaman, bukan kuota resmi gateway.")
     else:
         base_url = DEFAULT_OA_BASE_URL
-        st.subheader("Gemini API")
         key = st.text_input("API key", value=os.getenv("GEMINI_API_KEY", ""),
                             type="password", disabled=running,
                             help="Key dipakai di memori, tidak disimpan dalam cache atau laporan.")
@@ -124,11 +160,15 @@ with st.sidebar:
             st.info("Preset ini untuk kuota proyek Gemini 3.5 Flash Lite. Sesuaikan Advanced Settings dengan kuota model pilihanmu.")
         st.caption("Batas proyek: 15 RPM · 250.000 input TPM. Referensi RPD dapat diubah di bawah.")
         st.markdown("[Cek kuota proyek](https://aistudio.google.com/usage?tab=rate-limit)")
+    # T-UI-1 Area 2 (2a): divider pemisah zona kredensial → zona batas/kuota.
+    st.divider()
+    # T-UI-1 Area 2 (2b): subheader zona batas & kuota.
+    st.subheader("Batas & kuota")
     mode = st.selectbox("MODE", list(PROFILES), index=2, disabled=running)
     preset = PROFILES[mode]
     auto_tune = st.checkbox("Auto Tune Aggressive Mode", value=False, disabled=running)
     max_requests = st.number_input("Batas request sesi", 1, 10000, 490, disabled=running,
-                                   help="Seluruh percobaan, retry, dan countTokens masuk anggaran lokal.")
+                                   help="Seluruh percobaan, retry, dan countTokens masuk anggaran lokal.", format="%d")
     workers = st.selectbox("Concurrent request", [1, 2, 3, 4], index=preset["workers"]-1,
                           key=f"workers_{mode}", disabled=running)
     quota_limits = stored_quota_limits(WORKSPACE, model)
@@ -138,45 +178,45 @@ with st.sidebar:
     rpd_choice = st.selectbox("RPD safety", list(RPD_PRESETS), index=0 if mode == "Safe" else 1,
                              key=f"rpd_choice_{mode}", disabled=running, on_change=choose_rpd_preset)
     with st.expander("Advanced Settings"):
-        rpm = st.number_input("RPM hard", 1, 15, preset["rpm"], key=f"rpm_{mode}", disabled=running)
+        rpm = st.number_input("RPM hard", 1, 15, preset["rpm"], key=f"rpm_{mode}", disabled=running, format="%d")
         target_tpm = st.number_input("TPM target", 2000, 250000, preset["target_tpm"], step=1000,
-                                     key=f"target_tpm_{mode}", disabled=running)
+                                     key=f"target_tpm_{mode}", disabled=running, format="%d")
         tpm = st.number_input("TPM hard", 2000, 250000, preset["tpm"], step=1000,
-                              key=f"tpm_{mode}", disabled=running)
+                              key=f"tpm_{mode}", disabled=running, format="%d")
         official_rpd = st.number_input("Official RPD Limit", min_value=1,
                                        value=quota_limits.get("official_rpd", 500), step=1,
-                                       key=f"official_rpd_{model}", disabled=running)
+                                       key=f"official_rpd_{model}", disabled=running, format="%d")
         rpd = st.number_input("Local RPD Safety Limit", min_value=1,
                               value=quota_limits.get("rpd", RPD_PRESETS[rpd_choice]), step=1,
-                              key=rpd_key, disabled=running)
+                              key=rpd_key, disabled=running, format="%d")
         target_input = st.number_input("Target total input token/request", 512, 40000, preset["target_input_tokens"], step=1000,
-                                      key=f"input_{mode}", disabled=running)
+                                      key=f"input_{mode}", disabled=running, format="%d")
         max_input = st.number_input("Maksimum input token/request", 512, 40000, preset["max_input_tokens"], step=1000,
-                                   key=f"max_input_{mode}", disabled=running)
+                                   key=f"max_input_{mode}", disabled=running, format="%d")
         count_mode = st.selectbox("Penghitungan token", ["auto", "always", "estimate"], disabled=running,
                                  format_func=lambda x: {"auto": "Auto: kalibrasi awal + usage aktual", "always": "countTokens setiap batch", "estimate": "Estimasi + usage aktual"}[x])
         st.caption("Auto menghemat panggilan hitung. Estimasi mencakup seluruh prompt dan dikoreksi dari usageMetadata. "
                    "countTokens masuk RPM/TPM lokal, tetapi tidak menambah Local RPD.")
-        max_output = st.number_input("Maksimum output token", 2048, 65536, 65536, disabled=running)
+        max_output = st.number_input("Maksimum output token", 2048, 65536, 65536, disabled=running, format="%d")
         temperature = st.slider("Temperature", 0.0, 1.0, .2, .1, disabled=running)
-        retry = st.number_input("Retry gangguan API/koneksi", 0, 8, 5, disabled=running)
-        timeout = st.number_input("Timeout request (detik)", 5, 900, 600, disabled=running)
+        retry = st.number_input("Retry gangguan API/koneksi", 0, 8, 5, disabled=running, format="%d")
+        timeout = st.number_input("Timeout request (detik)", 5, 900, 600, disabled=running, format="%d")
     quota_keys = api_keys if api_keys else [None]
     if len(quota_keys) > 1:
-        qsel = st.selectbox("Key untuk RPD accounting",
+        qsel = st.selectbox("Key untuk akuntansi RPD",
                             quota_keys,
                             format_func=lambda k: f"key #{quota_keys.index(k) + 1} · {digest(k)[:8]}…",
                             key=f"rpdkey_{model}", disabled=running)
     else:
         qsel = quota_keys[0]
     used, reset_at = stored_quota(WORKSPACE, model, key=qsel)
-    with st.expander("Local RPD accounting"):
+    with st.expander("Akuntansi RPD lokal"):
         revision = st.session_state.get("rpd_edit_revision", 0)
         used_key = f"rpd_used_{model}_{used}_{revision}"
-        local_used = st.number_input("Current Local RPD Used", min_value=0, value=used or 0, step=1,
-                                     key=used_key, disabled=running or used is None)
-        st.warning("Changing or resetting Local RPD only changes the translator's internal "
-                   "counter. It does not reset the provider's real API quota.")
+        local_used = st.number_input("Pemakaian RPD lokal saat ini", min_value=0, value=used or 0, step=1,
+                                     key=used_key, disabled=running or used is None, format="%d")
+        st.warning("Mengubah atau mereset RPD lokal hanya mengubah penghitung internal "
+                   "translator. Kuota API resmi provider tidak ikut direset.")
         def apply_rpd_control(reset=False):
             try:
                 if reset:
@@ -187,12 +227,14 @@ with st.sidebar:
                                      rpd=st.session_state[rpd_key], key=qsel)
                 st.session_state["rpd_edit_revision"] = revision + 1
                 st.session_state["rpd_control_error"] = ""
+                # T-UI-1 Area 5 (5c): konfirmasi sukses simpan/reset → toast.
+                st.toast("RPD lokal direset ke 0." if reset else "RPD lokal tersimpan.")
             except Exception as exc:
                 st.session_state["rpd_control_error"] = safe_error(exc, api_keys)
         # Callbacks run before the full rerun: no early abort that would discard
         # later widgets' unsaved glossary, instructions or uploaded EPUB.
         st.button("Simpan RPD lokal", disabled=running or used is None, on_click=apply_rpd_control)
-        st.button("Reset Local RPD to 0", disabled=running or used is None,
+        st.button("Reset RPD lokal ke 0", disabled=running or used is None,
                   on_click=apply_rpd_control, args=(True,))
         if st.session_state.get("rpd_control_error"):
             st.error(st.session_state["rpd_control_error"])
@@ -200,6 +242,8 @@ with st.sidebar:
     key_note = "" if qsel is None else f" (key #{quota_keys.index(qsel) + 1})"
     st.caption(f"RPD lokal tersimpan{key_note}: {used if used is not None else 'tidak dapat dibaca'} / {rpd}. Reset: {reset_label} (00:00 Pasifik).")
     st.caption("Pemakaian aplikasi/perangkat lain tidak terlihat. Target TPM menyesuaikan kapasitas, ukuran batch dan latensi; bukan jaminan kecepatan.")
+    # T-UI-1 Area 2 (2a): divider pemisah zona batas/kuota → area utama.
+    st.divider()
 
 with st.expander("Gaya dan istilah", expanded=False):
     domain = st.radio("Domain terjemahan", ["fiction", "nonfiction"], key="domain", disabled=running,
@@ -239,7 +283,8 @@ if uploaded is not None:
     st.session_state["restored_job"] = False
     data = uploaded.getvalue()
     selection = digest(data)
-    st.write(f"{uploaded.name} · {len(data) / 1024 / 1024:.2f} MiB")
+    # T-UI-1 Area 5 (5a): info file → caption monospace, hirarki lebih ringan.
+    st.caption(f"`{uploaded.name}` · {len(data) / 1024 / 1024:.2f} MiB")
 
 if st.button("Mulai / lanjutkan", type="primary", disabled=running or uploaded is None):
     try:
@@ -277,6 +322,8 @@ if st.button("Mulai / lanjutkan", type="primary", disabled=running or uploaded i
                       if provider == "openai" else _translate_novel)
             st.session_state["job"] = BackgroundJob(source, output, options, runner=runner)
             registry["jobs"][registry_key] = {k: st.session_state[k] for k in ("job", "job_source", "job_settings")}
+        # T-UI-1 Area 5 (5c): umpan balik transien → toast.
+        st.toast("Job dimulai — progres tersimpan otomatis.")
         st.rerun()
     except Exception as exc:
         st.error(safe_error(exc, api_keys))
@@ -314,8 +361,8 @@ def performance_panel(m):
         st.caption("Token sumber adalah estimasi lokal; input/output API termasuk overhead prompt/JSON. "
                    "ETA belum memasukkan jeda antarhari ketika RPD habis.")
     if m["rpd_bottleneck"]:
-        st.warning("RPD is the current bottleneck. Increasing RPM will not increase daily translation capacity. "
-                   "Increase token packing efficiency instead.")
+        st.warning("RPD adalah bottleneck saat ini. Menaikkan RPM tidak menambah kapasitas "
+                   "harian — naikkan efisiensi packing token.")
 
 
 @st.fragment(run_every=1.0 if st.session_state.get("job") and st.session_state["job"].snapshot()["running"] else None)
@@ -338,14 +385,20 @@ def job_panel():
         matches = False
     if not matches and not state["running"]:
         return
-    st.progress(state["done"] / state["total"] if state["total"] else 0)
-    st.write(state["message"])
+    # T-UI-1 Area 5 (5b): progres + pesan status menyatu dalam satu bar (text=),
+    # menggantikan st.write ganda di bawahnya.
+    pct = state["done"] / state["total"] if state["total"] else 0
+    st.progress(pct, text=f"{pct * 100:.0f}% · {state['message']}")
+    # T-UI-1 Area 8 (8a): pembaca layar ikut update pesan progres via aria-live.
+    st.markdown(f'<span aria-live="polite" class="sr-only">{html.escape(state["message"])}</span>',
+                unsafe_allow_html=True)
     st.caption(f"Tersimpan: {state['done']}/{state['total']} · Request sesi: {state['requests']}")
     performance_panel(state.get("metrics", {}))
     if state["running"]:
         if st.button("Jeda setelah request aktif", disabled=job.cancel_event.is_set()):
             job.pause()
-            st.info("Jeda diminta. Request baru dihentikan; hasil valid request aktif tetap disimpan sebelum berhenti.")
+            # T-UI-1 Area 5 (5c): umpan balik transien → toast, bukan st.info.
+            st.toast("Jeda diminta — request aktif diselesaikan dulu.")
         return
     # Finish a full rerun once so disabled controls unlock and polling stops.
     if st.session_state.get("finished_job") is not job:
@@ -373,5 +426,10 @@ def job_panel():
 
 job_panel()
 st.divider()
-st.caption("Versi 2.4.1 · Aplikasi lokal. Pemeriksaan format tidak menjamin akurasi bahasa; "
-           "periksa sampel hasil dan istilah penting.")
+# T-UI-1 Area 1 (1c): caption → markdown agar class .footer-note bisa diterapkan;
+# teks byte-identik, fungsi tidak berubah (bukan input, tidak ada key/logika).
+st.markdown(
+    '<p class="footer-note">Versi 2.4.1 · Aplikasi lokal. Pemeriksaan format tidak menjamin akurasi bahasa; '
+    "periksa sampel hasil dan istilah penting.</p>",
+    unsafe_allow_html=True,
+)

@@ -2,8 +2,14 @@
 from __future__ import annotations
 
 import math
+import sqlite3
 import threading
+from .errors import CacheError
 from .models import canonical, digest
+
+# G2 (T-GEMINI-2): persist adaptif — state tuning ditulis tiap N sukses,
+# bukan tiap sukses. bad_response()/quota_error() tetap persist tanpa syarat.
+PERSIST_EVERY_N = 10
 
 
 class AdaptiveController:
@@ -23,6 +29,7 @@ class AdaptiveController:
         self.throttled = False
         self.output_ratio = 1.65
         self.successful = self.errors_429 = self.retries = self.invalid = 0
+        self._since_persist = 0  # G2: sukses sejak persist terakhir
         if cache:
             saved = cache.performance_get(options.model, self.key) or {}
             for field, lower, upper in (
@@ -41,6 +48,16 @@ class AdaptiveController:
         if self.cache:
             self.cache.performance_set(self.options.model, self.key, {field: getattr(self, field) for field in
                 ("target_tpm", "batch_target", "rpm", "workers", "output_ratio", "throttled")})
+        self._since_persist = 0
+
+    def persist(self):
+        """Force-persist state tuning. Kegagalan ditelan — monitoring tidak
+        boleh mengganggu alur utama. Aman dipanggil dari finally."""
+        try:
+            with self.lock:
+                self._persist()
+        except (CacheError, sqlite3.Error, OSError):
+            pass  # monitoring must not hide an already-published EPUB
 
     def snapshot(self):
         with self.lock:
@@ -97,4 +114,7 @@ class AdaptiveController:
             elif not self.throttled and self.options.auto_tune and self.quota_streak >= 10:
                 self.target_tpm = min(self.ceiling_tpm, math.ceil(self.target_tpm * 1.04))
                 self.quota_streak = 0
-            self._persist()
+            # G2: persist adaptif — tulis tiap PERSIST_EVERY_N sukses saja.
+            self._since_persist += 1
+            if self._since_persist >= PERSIST_EVERY_N:
+                self._persist()

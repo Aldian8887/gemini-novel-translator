@@ -48,4 +48,4 @@ kini terbaca, sehingga batch tidak perlu diminta ulang.
 - Identitas settings mode Gemini byte-identik antara 2.4.0 dan 2.4.1;
   diff file mesin inti (gemini_client, token_budget, pipeline, storage,
   epub, rate_limit, adaptive) bersih.
-- Live test rilis ini belum dijalankan; menunggu persetujuan estimasi token.
+- Live test rilis ini sudah dijalankan 6 Okt 2026: buku utuh DeepSeek 3.2 via bansosai selesai 2.048/2.048 dalam 46 request; watchdog `--oa-token-budget 400000` berhenti bersih di 1.962, sisa 86 unit selesai lewat resume (budget 450K); dashboard ±430.093/2.000.000 token (~21,5%). Alias transport dan batas output 32.768 ikut terpakai tanpa masalah validasi.

@@ -112,6 +112,12 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
                                 [], [])
                     good, bad_ids, issues = partial_fn(batch)
                     expected = {r.id: r for u in batch for r in u.runs}
+                    # G1 (T-GEMINI-2): run id respons yang tidak dikenal
+                    # dicatat dulu ke diagnostics sebelum difilter diam-diam.
+                    unknown = [rid for rid in good if rid not in expected]
+                    if unknown:
+                        diag.log("unknown_run_ids", units=len(batch), runs=len(unknown),
+                                 sample_ids=unknown[:5], extra={"count": len(unknown)})
                     good = {rid: validate_text(expected[rid], value)
                             for rid, value in good.items() if rid in expected}
                     bad_units = []
@@ -304,6 +310,7 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
                 raise
             finally:
                 emit_metrics()
+                controller.persist()  # G2 (T-GEMINI-2): force-persist state tuning saat pause/selesai/error
                 if translator is not None:
                     translator.close()
     except Paused as exc:
