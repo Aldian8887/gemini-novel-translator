@@ -49,3 +49,30 @@ kini terbaca, sehingga batch tidak perlu diminta ulang.
   diff file mesin inti (gemini_client, token_budget, pipeline, storage,
   epub, rate_limit, adaptive) bersih.
 - Live test rilis ini sudah dijalankan 6 Okt 2026: buku utuh DeepSeek 3.2 via bansosai selesai 2.048/2.048 dalam 46 request; watchdog `--oa-token-budget 400000` berhenti bersih di 1.962, sisa 86 unit selesai lewat resume (budget 450K); dashboard ±430.093/2.000.000 token (~21,5%). Alias transport dan batas output 32.768 ikut terpakai tanpa masalah validasi.
+
+## Update 10 Okt 2026 — Dashboard Komando (tema Ember Control)
+
+Atas masukan pengguna bahwa polish UI sebelumnya "hanya terasa beda warna",
+tampilan aplikasi dirombak struktural menjadi **Dashboard Komando** dengan
+palet **Ember Control** (latar hangat gelap #141010, aksen amber #FBBF24):
+
+- Layout `wide` + tema gelap resmi via `.streamlit/config.toml`
+  (base dark, primary amber, background #141010).
+- Header dengan **pill status** live: SIAP / BERJALAN (berdenyut) / SELESAI / GAGAL.
+- **Kartu Status Key**: tiap API key tampil sebagai kartu dengan bar RPD
+  (terpakai/batas + waktu reset) — informasi yang sebelumnya terkubur di sidebar.
+- **Statistik Misi**: 4 metrik sekilas (request sesi, rolling TPM, RPD tersisa, ETA).
+- **Command Deck**: area operasi (gaya & istilah, upload EPUB, tombol mulai)
+  dikelompokkan sebagai dek komando; sidebar dirampingkan menjadi panel Kontrol.
+- Aksesibilitas T-UI-1 dipertahankan (aria-live + kelas sr-only).
+
+Jaminan tak berubah: seluruh widget key dan urutannya identik, konstruksi
+`TranslationOptions` 27 kwargs identik (terverifikasi AST), tidak ada perubahan
+logika job/pipeline. Render terverifikasi lewat screenshot headless: tema gelap
+tampil benar, kontras teks aman.
+
+### Revisi 10 Okt 2026 (sore)
+- Header seksi diseragamkan ke Bahasa Inggris: Key Status, Mission Stats,
+  Command Deck (sebelumnya campur Indonesia/Inggris).
+- Emoji header diganti ikon garis elegan (Lucide, lisensi ISC) warna amber,
+  di-embed sebagai data URI SVG sehingga tanpa dependensi eksternal.
