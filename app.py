@@ -18,6 +18,8 @@ from novel_translator.openai_client import OpenAICompatibleTranslator
 from novel_translator.pipeline import translate_novel as _translate_novel
 from functools import partial as _partial
 from novel_translator.storage import atomic_bytes
+from novel_translator.translation_skills import (PROFILE_CHOICES, SKILL_PROFILES,
+                                               skill_overhead_tokens)
 from novel_translator.preferences import (checkpoints, load_preferences, save_preferences, stored_quota,
                                           stored_quota_limits, save_local_quota)
 
@@ -146,6 +148,9 @@ def restore_settings(settings):
         st.session_state["oa_base_url"] = settings.get("oa_base_url", DEFAULT_OA_BASE_URL)
     st.session_state["glossary"] = "\n".join(f"{k} = {v}" for k, v in settings.get("glossary", {}).items())
     st.session_state["instruction"] = settings.get("custom_instruction", "")
+    st.session_state["skill_on"] = settings.get("skill", "off") != "off"
+    _prof = settings.get("skill_profile", "general")
+    st.session_state["skill_profile"] = _prof if _prof in PROFILE_CHOICES else "general"
 
 
 if "preferences_loaded" not in st.session_state:
@@ -380,6 +385,25 @@ with st.expander("Gaya dan istilah", expanded=False):
     instruction = st.text_area("Instruksi tambahan", placeholder="Gunakan aku/kau untuk dialog akrab.",
                                key="instruction", disabled=running)
 
+with st.expander("Translation Skills (webnovel)", expanded=False):
+    skill_on = st.checkbox(
+        "Aktifkan Webnovel Translation Skill", key="skill_on", disabled=running,
+        help="Opsi nonaktif = perilaku persis seperti sebelumnya (tanpa overhead prompt, "
+             "cache lama tetap dipakai). Aktif = instruksi sastra ringkas per genre "
+             "digabung ke prompt; hasil memakai namespace cache sendiri.")
+    skill_profile = st.selectbox(
+        "Profil genre", PROFILE_CHOICES, key="skill_profile", disabled=running,
+        format_func=lambda p: SKILL_PROFILES[p][0],
+        help="Umum: narasi natural. Xianxia: istilah kultivasi dijaga. Progression: "
+             "nama skill/angka konsisten. Misteri: ambiguitas dijaga. Character-Driven: "
+             "suara tiap tokoh dibedakan.")
+    if skill_on:
+        _ov = skill_overhead_tokens("lean", skill_profile)
+        st.caption(f"Estimasi overhead: ~{_ov} token/request. Skill v1.0 (Lean). "
+                   "Mode Full/Deep belum tersedia — menyusul setelah uji A/B.")
+    else:
+        st.caption("Skill mati: prompt dan cache identik dengan versi tanpa skill.")
+
 uploaded = st.file_uploader("Pilih EPUB", type=["epub"], disabled=running)
 st.caption("Heading, bold/italic, CSS, gambar, footnote, dan tautan dipertahankan. "
            "File sumber tetap utuh. Teks buku dikirim ke "
@@ -399,13 +423,222 @@ if uploaded is not None:
     selection = digest(data)
     st.caption(f"`{uploaded.name}` · {len(data) / 1024 / 1024:.2f} MiB")
 
+with st.expander("Book Memory v0 — glosarium & catatan per buku", expanded=False):
+    # Penyimpanan terminologi permanen per buku di atas mekanisme glossary yang
+    # sudah ada. Prompt, engine, cache, dan checkpoint tidak berubah: glossary
+    # tetap masuk lewat TranslationOptions.glossary seperti kolom Glosarium.
+    st.caption("Glosarium permanen per buku + catatan karakter manual (opsional). "
+               "Memakai injeksi glossary yang sudah ada — tanpa perubahan prompt/engine/cache. "
+               "Perubahan glossary otomatis memakai namespace cache baru (aman).")
+    try:
+        from novel_translator.book_memory import (
+            BookMemoryStore, BookMemory, GlossaryTerm, CharacterNote,
+            compute_book_id, detect_conflicts, units_affected_by_change,
+            validate_glossary, CHARACTER_BLOCK_MAX_CHARS)
+        from novel_translator.epub import EpubBook as _EpubBook
+        _bm_available = True
+    except Exception as _bm_err:  # jangan merusak UI bila modul bermasalah
+        _bm_available = False
+        st.error(f"Book Memory tidak tersedia: {_bm_err}")
+    if _bm_available:
+        _bm_store = BookMemoryStore()
+        if uploaded is None or data is None:
+            st.info("Unggah EPUB untuk melihat atau mengelola memori buku ini.")
+        else:
+            import tempfile as _tf
+            _tmp = Path(_tf.gettempdir()) / f"bm_{digest(data)[:12]}.epub"
+            if not _tmp.exists():
+                _tmp.write_bytes(data)
+            try:
+                _book_id = compute_book_id(_tmp)
+            except Exception as _e:
+                st.error(f"Gagal menghitung identitas buku: {_e}")
+                _book_id = None
+            if _book_id:
+                st.code(f"Book ID: {_book_id}", language=None)
+                _mem = _bm_store.load(_book_id)
+                if _mem.title != uploaded.name:
+                    _mem.title = uploaded.name
+                _bm_tabs = st.tabs(["Glosarium", "Konflik & Dampak", "Karakter", "Impor/Ekspor", "Validasi"])
+                # Kunci widget menyertakan book_id agar state editor tidak tercampur
+                # saat pengguna berganti buku.
+                _k = lambda name: f"{name}_{_book_id}"
+
+                def _rows_to_terms(rows):
+                    return [GlossaryTerm(term=str(r.get("Istilah") or "").strip(),
+                                         translation=str(r.get("Terjemahan") or "").strip(),
+                                         approved=bool(r.get("Approved", True)),
+                                         note=str(r.get("Catatan") or "").strip())
+                            for r in rows if str(r.get("Istilah") or "").strip()]
+
+                def _editor_records(editor_out):
+                    # data_editor mengembalikan tipe yang sama dengan input:
+                    # list-of-dicts -> list, DataFrame -> DataFrame.
+                    if hasattr(editor_out, "to_dict"):
+                        return editor_out.to_dict("records")
+                    return list(editor_out)
+
+                with _bm_tabs[0]:
+                    _rows = [{"Istilah": t.term, "Terjemahan": t.translation,
+                              "Approved": t.approved, "Catatan": t.note} for t in _mem.terms]
+                    # PENTING: pakai NILAI KEMBALI data_editor (data lengkap),
+                    # bukan st.session_state[key] (itu hanya delta perubahan).
+                    _edited_df = st.data_editor(
+                        _rows, num_rows="dynamic", key=_k("bm_terms"),
+                        column_config={"Approved": st.column_config.CheckboxColumn()},
+                        disabled=running)
+                    _edited_records = _editor_records(_edited_df)
+                    _c1, _c2 = st.columns(2)
+                    if _c1.button("Simpan ke Book Memory", disabled=running):
+                        _mem.terms = _rows_to_terms(_edited_records)
+                        _bm_store.save(_mem)
+                        st.success(f"Tersimpan: {len(_mem.terms)} istilah.")
+
+                    def _cb_load_glossary(records=_edited_records):
+                        # Callback: berjalan SEBELUM eksekusi skrip berikutnya,
+                        # jadi aman mengubah state widget "glossary". Memakai isi
+                        # editor saat ini (bukan hanya yang tersimpan).
+                        _terms = _rows_to_terms(records)
+                        st.session_state["glossary"] = "\n".join(
+                            f"{t.term} = {t.translation}"
+                            for t in _terms if t.approved and t.translation)
+                    _c2.button("Muat ke kolom Glosarium", disabled=running,
+                               on_click=_cb_load_glossary,
+                               help="Isi kolom Glosarium utama dengan istilah approved buku ini.")
+                with _bm_tabs[1]:
+                    _conf = detect_conflicts(_rows_to_terms(_edited_records))
+                    if _conf:
+                        for _c in _conf:
+                            st.warning(f"[{_c.kind}] {_c.message}")
+                    else:
+                        st.success("Tidak ada konflik/duplikasi terdeteksi.")
+                    st.divider()
+                    st.caption("Unit yang perlu diterjemahkan ulang bila glossary berubah "
+                               "(dibanding memori tersimpan):")
+                    if st.button("Hitung unit terdampak", disabled=running):
+                        try:
+                            _units = _EpubBook(str(_tmp)).units
+                            _aff = units_affected_by_change(
+                                _mem.terms, _rows_to_terms(_edited_records), _units)
+                            if _aff:
+                                st.warning(f"{len(_aff)} unit terdampak: {', '.join(_aff[:20])}"
+                                           + ("…" if len(_aff) > 20 else ""))
+                            else:
+                                st.success("Tidak ada unit terdampak.")
+                        except Exception as _e:
+                            st.error(f"Gagal menghitung: {_e}")
+                with _bm_tabs[2]:
+                    st.caption("Catatan karakter bersifat **manual & opsional** — ditulis olehmu, "
+                               "bukan disimpulkan AI. Jangan masukkan info dari bab selanjutnya "
+                               "untuk menerjemahkan bab sebelumnya. "
+                               f"Maksimal injeksi {CHARACTER_BLOCK_MAX_CHARS} karakter.")
+                    _crows = [{"Nama": c.name, "Alias": ", ".join(c.aliases),
+                               "Sapaan/Gelar": c.title, "Hubungan (terkonfirmasi)": c.relationships,
+                               "Register dialog": c.register_note, "Dikenal dari": c.known_from}
+                              for c in _mem.characters]
+                    _cedited_df = st.data_editor(_crows, num_rows="dynamic", key=_k("bm_chars"),
+                                               disabled=running)
+                    _cedited_records = _editor_records(_cedited_df)
+                    if st.button("Simpan catatan karakter", disabled=running):
+                        _mem.characters = [CharacterNote(
+                            name=str(r.get("Nama") or "").strip(),
+                            aliases=[a.strip() for a in str(r.get("Alias") or "").split(",") if a.strip()],
+                            title=str(r.get("Sapaan/Gelar") or "").strip(),
+                            relationships=str(r.get("Hubungan (terkonfirmasi)") or "").strip(),
+                            register_note=str(r.get("Register dialog") or "").strip(),
+                            known_from=str(r.get("Dikenal dari") or "").strip())
+                            for r in _cedited_records if str(r.get("Nama") or "").strip()]
+                        _bm_store.save(_mem)
+                        st.success(f"Tersimpan: {len(_mem.characters)} karakter.")
+                    st.divider()
+                    st.caption("Pratinjau blok yang disuntik (disaring per bab — anti spoiler).")
+                    st.warning("Batasan: kolom Instruksi tambahan bersifat GLOBAL (berlaku untuk "
+                               "semua bab yang diterjemahkan setelahnya). Pipeline belum mampu "
+                               "menerapkan catatan per bab secara otomatis — fitur ini adalah "
+                               "referensi manual. Salin blok hanya untuk rentang bab yang sesuai.",
+                               icon="⚠️")
+                    _chap = st.number_input("Bab yang sedang diterjemahkan", min_value=1, value=1,
+                                            disabled=running, key=_k("bm_chapter"),
+                                            help="Hanya catatan dengan 'Dikenal dari' ≤ bab ini yang disertakan.")
+                    _block = _mem.character_block(chapter=int(_chap))
+                    _scoped_block = (f"[Catatan karakter — aman untuk bab ≤ {int(_chap)}]\n{_block}"
+                                     if _block else "")
+                    st.text_area("Blok karakter", _block or "(tidak ada catatan untuk bab ini)",
+                                 height=120, disabled=True)
+                    # CATATAN: pratinjau ini SENGAJA tanpa key — widget ber-key menyimpan
+                    # nilainya di session state dan tidak me-refresh saat _block berubah.
+
+                    def _cb_copy_block(block=_scoped_block):
+                        _cur = st.session_state.get("instruction", "")
+                        st.session_state["instruction"] = (_cur + "\n\n" + block).strip()
+                    st.button("Salin blok ke Instruksi tambahan", disabled=running or not _block,
+                              on_click=_cb_copy_block,
+                              help="Menambahkan blok karakter (berlabel batas bab) ke kolom Instruksi "
+                                   "tambahan. Manual dan eksplisit — tanpa klaim peningkatan kualitas.")
+                with _bm_tabs[3]:
+                    _d1, _d2 = st.columns(2)
+                    _exp = _bm_store.export_glossary_file(_book_id, Path(_tf.gettempdir()) / f"{_book_id}.glossary.txt")
+                    _d1.download_button("Unduh glosarium (.txt)", _exp.read_text(encoding="utf-8"),
+                                        file_name=f"{_book_id}.glossary.txt")
+                    _d1.caption("Format kompatibel dengan flag CLI `--glossary`.")
+                    _up = _d2.file_uploader("Impor glosarium (.txt / .json)", type=["txt", "json"],
+                                            disabled=running, key="bm_import")
+                    if _up is not None and _d2.button("Impor sekarang", disabled=running):
+                        try:
+                            _raw = _up.getvalue().decode("utf-8")
+                            if _up.name.endswith(".json"):
+                                _data = json.loads(_raw)
+                                _items = _data.get("terms", _data) if isinstance(_data, dict) else _data
+                                _imp = [(str(i.get("term", i if isinstance(i, str) else "")),
+                                         str(i.get("translation", ""))) for i in _items]
+                            else:
+                                _imp = [(k.strip(), v.strip()) for k, v in
+                                        (ln.split("=", 1) for ln in _raw.splitlines()
+                                         if "=" in ln and not ln.strip().startswith("#"))]
+                            _mem.terms = [GlossaryTerm(term=k, translation=v)
+                                           for k, v in _imp if k and v]
+                            _bm_store.save(_mem)
+                            st.success(f"Diimpor: {len(_mem.terms)} istilah.")
+                        except Exception as _e:
+                            st.error(f"Gagal impor: {_e}")
+                with _bm_tabs[4]:
+                    st.caption("Periksa apakah terjemahan memakai padanan approved. "
+                               "Unggah EPUB sumber + EPUB hasil (paragraf disejajarkan berurutan).")
+                    _v1, _v2 = st.columns(2)
+                    _vsrc = _v1.file_uploader("EPUB sumber", type=["epub"], key="bm_vsrc", disabled=running)
+                    _vout = _v2.file_uploader("EPUB hasil", type=["epub"], key="bm_vout", disabled=running)
+                    if _vsrc and _vout and st.button("Jalankan validasi", disabled=running):
+                        try:
+                            from novel_translator.book_memory import validate_epub_pair as _vep
+                            _sp = Path(_tf.gettempdir()) / "bm_vsrc.epub"; _sp.write_bytes(_vsrc.getvalue())
+                            _op = Path(_tf.gettempdir()) / "bm_vout.epub"; _op.write_bytes(_vout.getvalue())
+                            _res = _vep(_sp, _op, _mem.glossary_dict())
+                            if _res.status == "unverifiable":
+                                st.error(f"Tidak dapat diverifikasi: {_res.detail}. "
+                                         f"Validator TIDAK menyatakan istilah konsisten.")
+                            elif _res.violations:
+                                st.warning(f"{len(_res.violations)} pelanggaran "
+                                           f"dari {_res.units_checked} unit:")
+                                st.dataframe([{"Unit": v.unit_id, "Istilah": v.term,
+                                               "Seharusnya": v.expected,
+                                               "Detail": v.detail} for v in _res.violations],
+                                             use_container_width=True)
+                            else:
+                                st.success(f"Terverifikasi: semua istilah approved dipakai "
+                                           f"dengan benar ({_res.units_checked} unit).")
+                        except Exception as _e:
+                            st.error(f"Gagal validasi: {_e}")
+
 if st.button("Mulai / lanjutkan", type="primary", disabled=running or uploaded is None):
     try:
         if len(data) > 150 * 1024 * 1024:
             raise ValueError("Ukuran maksimal EPUB adalah 150 MiB.")
         options = TranslationOptions(api_keys=api_keys, api_key=api_keys[0] if api_keys else "",
                                      model=model, provider=provider, oa_base_url=base_url,
-                                     style=style, domain=domain, ignore_cache=regen,
+                                     style=style, domain=domain,
+                                     skill=("lean" if skill_on else "off"),
+                                     skill_profile=skill_profile,
+                                     ignore_cache=regen,
                                      glossary=parse_glossary(glossary_raw), custom_instruction=instruction,
                                      max_requests=max_requests, rpm=rpm, tpm=tpm, rpd=rpd,
                                      official_rpd=official_rpd, target_tpm=target_tpm,
@@ -489,7 +722,9 @@ def job_panel():
                                      custom_instruction=instruction,
                                      domain=st.session_state.get("domain", "fiction"),
                                      provider=st.session_state.get("provider", "gemini"),
-                                     oa_base_url=st.session_state.get("oa_base_url", DEFAULT_OA_BASE_URL))
+                                     oa_base_url=st.session_state.get("oa_base_url", DEFAULT_OA_BASE_URL),
+                                     skill=("lean" if st.session_state.get("skill_on") else "off"),
+                                     skill_profile=st.session_state.get("skill_profile", "general"))
         current.validate()
         matches = selection == st.session_state.get("job_source") and (
             canonical(current.settings()) == st.session_state.get("job_settings"))
