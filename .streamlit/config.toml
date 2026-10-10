@@ -6,3 +6,10 @@ enableCORS = true
 
 [browser]
 gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#FBBF24"
+backgroundColor = "#141010"
+secondaryBackgroundColor = "#241D18"
+textColor = "#F5F0EB"
