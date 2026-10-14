@@ -209,9 +209,16 @@ class TranslationOptions:
     oa_token_budget: int = 0  # v2.4.1: anggaran token sesi khusus "openai" (0 = mati); operasional, tidak masuk settings()
     style: str = DEFAULT_STYLE
     domain: str = "fiction"  # v2.3.0: "fiction" | "nonfiction" (prompt + namespace cache)
+    skill: str = "off"  # skill webnovel: "off" | "lean" (prompt + namespace cache bila aktif)
+    skill_profile: str = "general"  # profil genre skill: general|xianxia|progression|mystery|character
     ignore_cache: bool = False  # v2.3.0: generate ulang dari nol (abaikan cache; timpa output)
     glossary: dict[str, str] = field(default_factory=dict)
     custom_instruction: str = ""
+    # Book Memory v1 — autonomous glossary (default OFF: perilaku lama identik)
+    auto_glossary: bool = False      # discovery + chronological learning aktif
+    auto_verify: bool = False       # AI semantic verification aktif
+    approval_policy: str = "review_first"  # "review_first" | "auto_safe" (opt-in)
+    character_notes: bool = False   # v2.6.0: injeksi catatan karakter per bab (opt-in)
     chunk_chars: int = 8000  # Accepted for old callers; never used for batching.
     max_requests: int = 490
     rpm: int = 13
@@ -271,6 +278,12 @@ class TranslationOptions:
     def validate(self):
         if self.provider not in PROVIDERS:
             raise ValueError("Provider harus 'gemini' atau 'openai'.")
+        from .translation_skills import validate_skill
+        validate_skill(self.skill, self.skill_profile)
+        # v2.6.0: catatan karakter hidup di Book Memory -> butuh mode v1.
+        if self.character_notes and not self.auto_glossary:
+            raise ValueError("character_notes membutuhkan auto_glossary=True "
+                             "(catatan karakter disimpan di Book Memory).")
         self.model = self.model.removeprefix("models/").strip()
         if self.provider == "gemini":
             if not re.fullmatch(r"gemini-[a-zA-Z0-9._-]+", self.model):
@@ -352,6 +365,21 @@ class TranslationOptions:
         if self.provider != "gemini":
             result["provider"] = self.provider
             result["oa_base_url"] = self.oa_base_url
+        # Skill webnovel: hanya masuk identitas cache bila aktif, dengan pola
+        # yang sama (default "off" sengaja tidak ditulis agar settings/job_id
+        # lama byte-identik dan cache 2.x tetap terbaca).
+        from .translation_skills import skill_settings_fragment
+        result.update(skill_settings_fragment(self.skill, self.skill_profile))
+        # Book Memory v1: hanya masuk identitas cache bila auto glossary aktif.
+        # Default OFF sengaja tidak ditulis agar settings/job_id lama identik.
+        if self.auto_glossary:
+            result["auto_glossary"] = True
+            result["auto_verify"] = bool(self.auto_verify)
+            result["approval_policy"] = self.approval_policy
+        # v2.6.0: hanya ditulis bila opt-in; default OFF sengaja tidak ditulis
+        # agar settings/job_id lama byte-identik dan cache lama tetap terbaca.
+        if self.character_notes:
+            result["character_notes"] = True
         return result
 
 

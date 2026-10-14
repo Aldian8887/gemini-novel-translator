@@ -112,8 +112,11 @@ class TokenEstimator:
 
 
 class PromptBuilder:
-    def __init__(self, options):
+    def __init__(self, options, chapter_notes=""):
         self.options = options
+        # v2.6.0: blok catatan karakter per bab (opt-in); string kosong bila
+        # OFF sehingga prompt byte-identik dengan semula (0 overhead token).
+        self.chapter_notes = chapter_notes or ""
         self.terms = [(key, re.compile(r"(?<!\w)" + r"\s+".join(
             re.escape(w) for w in key.split()) + r"(?!\w)", re.IGNORECASE))
             for key in options.glossary]
@@ -183,6 +186,16 @@ class PromptBuilder:
             style = NONFICTION_DEFAULT_STYLE
         instruction = DOMAIN_SYSTEMS.get(self.options.domain, SYSTEM) + "\n" + canonical({
             "style": style, "additional_instruction": self.options.custom_instruction})
+        # Skill webnovel (opsional): teks instruksi ringkas digabung di sini;
+        # string kosong bila skill OFF sehingga prompt byte-identik dengan semula.
+        from .translation_skills import compose_skill_text
+        skill_text = compose_skill_text(self.options.skill, self.options.skill_profile)
+        if skill_text:
+            instruction += "\n" + skill_text
+        # v2.6.0: catatan karakter per bab (opt-in, anti-spoiler per bab);
+        # kosong bila OFF sehingga prompt byte-identik dengan semula.
+        if self.chapter_notes:
+            instruction += "\n" + self.chapter_notes
         generation = {"responseMimeType": "application/json", "responseSchema": SCHEMA,
                       "maxOutputTokens": self.output_limit, "candidateCount": 1,
                       "temperature": self.options.temperature}
