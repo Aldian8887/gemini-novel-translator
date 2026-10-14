@@ -16,13 +16,10 @@ Kesimpulan jujur: bukan bug aplikasi; keterbatasan arsitektural
 Tes-tes ini offline (tanpa API): mem-pin garansi struktural pipeline
 agar tidak regresi diam-diam, dan mendokumentasikan keterbatasan.
 """
-import sys
 import zipfile
 from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from novel_translator.epub import EpubBook
 from novel_translator.models import TranslationOptions, validate_response_partial

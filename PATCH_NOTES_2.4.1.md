@@ -76,3 +76,33 @@ tampil benar, kontras teks aman.
   Command Deck (sebelumnya campur Indonesia/Inggris).
 - Emoji header diganti ikon garis elegan (Lucide, lisensi ISC) warna amber,
   di-embed sebagai data URI SVG sehingga tanpa dependensi eksternal.
+
+## Update 10 Okt 2026 — Webnovel Translation Skill v1.0 (Lean)
+
+Implementasi inkremental dari spek skill: HANYA mode Lean sebagai satu
+variabel. Mode Full/Deep menyusul setelah uji A/B.
+
+Yang berubah:
+- Modul baru `novel_translator/translation_skills.py`: SKILL_VERSION=1.0,
+  5 profil genre (general, xianxia, progression, mystery, character), komposisi
+  instruksi deterministik. Tanpa dependensi baru, tanpa API call tambahan.
+- `TranslationOptions`: field `skill` ("off"|"lean", default "off") dan
+  `skill_profile`. Mengikuti pola domain/provider: konfigurasi skill HANYA
+  masuk identitas cache saat aktif — Skill OFF membuat settings/job_id
+  byte-identik dengan sebelumnya (cache lama tetap terbaca). PROMPT_VERSION
+  dan ENGINE_VERSION tidak berubah (versioning terpisah: skill_version).
+- `PromptBuilder`: teks skill digabung ke system instruction bila aktif;
+  string kosong bila OFF (prompt byte-identik).
+- UI: expander "Translation Skills (webnovel)" — checkbox aktif, pilihan
+  profil genre, indikator estimasi overhead token. CLI: --skill, --skill-profile.
+
+Yang TIDAK berubah: perilaku default (Skill OFF), engine, prompt inti,
+validasi/salvage, cache/checkpoint/progress lama, struktur EPUB.
+
+Overhead terukur (tokenizer proyek): general ~273, xianxia ~329, progression
+~293, mystery ~300, character ~306 token/request. OFF = 0.
+
+Verifikasi: 22/22 regression test lolos (tests/test_translation_skills.py) —
+mencakup settings byte-identik saat OFF, isolasi cache antar profil, prompt
+deterministik, dan kontrak body tak berubah. Render UI terverifikasi via
+screenshot headless.

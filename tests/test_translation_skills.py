@@ -7,12 +7,7 @@ Kontrak yang dijaga:
    antar versi skill); prompt deterministik.
 3. Tidak ada API call; semua tes offline dengan mock.
 """
-import sys
-from pathlib import Path
-
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from novel_translator.models import TranslationOptions, canonical, digest
 from novel_translator.translation_skills import (
