@@ -23,6 +23,18 @@ class ProgressMetrics:
                 self.done[i] += amount
         self.committed_requests += 1
 
+    def inherit(self, rids):
+        """v2.6.0: unit terwariskan dihitung selesai TANPA request API.
+
+        Beda dengan commit(): tidak menambah committed_requests agar estimasi
+        token-per-request tidak tercemar oleh pekerjaan nol-request.
+        """
+        for rid in rids:
+            if rid not in self.amounts:
+                continue
+            for i, amount in enumerate(self.amounts[rid]):
+                self.done[i] += amount
+
     def snapshot(self, limiter, controller):
         state = limiter.snapshot() | controller.snapshot()
         elapsed = max(.001, time.monotonic() - self.started)

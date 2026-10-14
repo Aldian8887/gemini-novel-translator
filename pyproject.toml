@@ -1,6 +1,6 @@
 [project]
 name = "gemini-epub-translator-en-id"
-version = "2.4.1"
+version = "2.6.0"
 description = "Local EPUB-preserving English to Indonesian translator"
 requires-python = ">=3.11,<3.15"
 
@@ -8,6 +8,11 @@ requires-python = ">=3.11,<3.15"
 testpaths = ["tests"]
 addopts = "-ra"
 pythonpath = ["."]
+markers = [
+    "unit: unit tests (fast, no I/O beyond tmp)",
+    "integration: integration tests (real sqlite/epub, still offline)",
+    "slow: slow tests (deselect with -m 'not slow')",
+]
 
 [tool.ruff]
 target-version = "py311"

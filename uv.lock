@@ -1,0 +1,8 @@
+version = 1
+revision = 5
+requires-python = ">=3.11, <3.15"
+
+[[package]]
+name = "gemini-epub-translator-en-id"
+version = "2.4.1"
+source = { virtual = "." }
