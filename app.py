@@ -60,7 +60,7 @@ div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #FBBF24 !impo
 .stProgress > div > div > div { background: linear-gradient(90deg, #F59E0B, #FBBF24) !important; }
 .stProgress > div > div { border-radius: 9999px; }
 .stCaption { color: #A8A29E; }
-.footer-note { margin-top: 0.5rem; color: #78716C; }
+.footer-note { margin-top: 0.5rem; color: #A8A29E; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 button[kind="primary"] { border-radius: 0.5rem; }
@@ -80,7 +80,7 @@ def _h3(icon, text):
            f'style="vertical-align:-3px; margin-right:0.5rem;" alt="">')
     st.markdown(f"<h3>{img}{text}</h3>", unsafe_allow_html=True)
 
-st.set_page_config(page_title="Translator EPUB", page_icon="📖", layout="wide")
+st.set_page_config(page_title="Translator EPUB", layout="wide")
 
 if hasattr(st, "html"):
     st.html(_EMBER_CSS)
@@ -459,7 +459,7 @@ with st.expander("Book Memory v0 — glosarium & catatan per buku", expanded=Fal
                 _mem = _bm_store.load(_book_id)
                 if _mem.title != uploaded.name:
                     _mem.title = uploaded.name
-                _bm_tabs = st.tabs(["Glosarium", "Konflik & Dampak", "Karakter", "Impor/Ekspor", "Validasi"])
+                _bm_tabs = st.tabs(["Glosarium", "Konflik & Dampak", "Karakter", "Impor/Ekspor", "Validasi", "Otomatis v1"])
                 # Kunci widget menyertakan book_id agar state editor tidak tercampur
                 # saat pengguna berganti buku.
                 _k = lambda name: f"{name}_{_book_id}"
@@ -479,18 +479,51 @@ with st.expander("Book Memory v0 — glosarium & catatan per buku", expanded=Fal
                     return list(editor_out)
 
                 with _bm_tabs[0]:
+                    # Spoiler-safe: bila Reader Progress diset, istilah dari bab
+                    # sesudahnya disembunyikan dari tampilan (dan editor dikunci
+                    # agar tidak merusak istilah tersembunyi).
+                    _all_terms = _mem.terms
+                    _vis_terms = _mem.visible_terms()
+                    _hidden_n = len(_all_terms) - len(_vis_terms)
+                    if _hidden_n:
+                        st.info(f"{_hidden_n} istilah disembunyikan oleh Reader Progress "
+                                f"(bab {_mem.reader_progress}). Nonaktifkan filter untuk mengedit.")
                     _rows = [{"Istilah": t.term, "Terjemahan": t.translation,
-                              "Approved": t.approved, "Catatan": t.note} for t in _mem.terms]
+                              "Approved": t.approved, "Catatan": t.note} for t in _vis_terms]
                     # PENTING: pakai NILAI KEMBALI data_editor (data lengkap),
                     # bukan st.session_state[key] (itu hanya delta perubahan).
                     _edited_df = st.data_editor(
                         _rows, num_rows="dynamic", key=_k("bm_terms"),
                         column_config={"Approved": st.column_config.CheckboxColumn()},
-                        disabled=running)
+                        disabled=running or bool(_hidden_n))
                     _edited_records = _editor_records(_edited_df)
                     _c1, _c2 = st.columns(2)
-                    if _c1.button("Simpan ke Book Memory", disabled=running):
-                        _mem.terms = _rows_to_terms(_edited_records)
+                    if _c1.button("Simpan ke Book Memory", disabled=running or bool(_hidden_n)):
+                        # Simpan hanya istilah yang tampil; yang tersembunyi dipertahankan.
+                        _vis_names = {t.term for t in _vis_terms}
+                        _edited_map = {str(r.get("Istilah") or ""): r for r in _edited_records}
+                        _new_terms = [t for t in _all_terms if t.term not in _vis_names]
+                        for _t in _vis_terms:
+                            _r = _edited_map.get(_t.term)
+                            if _r is None:
+                                continue  # dihapus user dari editor
+                            _new_terms.append(GlossaryTerm(
+                                term=str(_r.get("Istilah") or "").strip(),
+                                translation=str(_r.get("Terjemahan") or "").strip(),
+                                approved=bool(_r.get("Approved", True)),
+                                note=str(_r.get("Catatan") or "").strip(),
+                                status=_t.status, origin=_t.origin,
+                                source_chapter=_t.source_chapter, evidence=_t.evidence,
+                                history=_t.history, updated_at=_t.updated_at))
+                        # baris baru yang ditambahkan user
+                        for _name, _r in _edited_map.items():
+                            if _name and _name not in _vis_names:
+                                _new_terms.append(GlossaryTerm(
+                                    term=_name,
+                                    translation=str(_r.get("Terjemahan") or "").strip(),
+                                    approved=bool(_r.get("Approved", True)),
+                                    note=str(_r.get("Catatan") or "").strip()))
+                        _mem.terms = [t for t in _new_terms if t.term]
                         _bm_store.save(_mem)
                         st.success(f"Tersimpan: {len(_mem.terms)} istilah.")
 
@@ -577,9 +610,24 @@ with st.expander("Book Memory v0 — glosarium & catatan per buku", expanded=Fal
                                    "tambahan. Manual dan eksplisit — tanpa klaim peningkatan kualitas.")
                 with _bm_tabs[3]:
                     _d1, _d2 = st.columns(2)
-                    _exp = _bm_store.export_glossary_file(_book_id, Path(_tf.gettempdir()) / f"{_book_id}.glossary.txt")
-                    _d1.download_button("Unduh glosarium (.txt)", _exp.read_text(encoding="utf-8"),
-                                        file_name=f"{_book_id}.glossary.txt")
+                    # Ekspor spoiler-safe: default hanya istilah approved yang
+                    # diizinkan Reader Progress (visible_terms).
+                    from novel_translator.book_memory import spoiler_safe_glossary_text as _safe_txt
+                    _d1.download_button("Unduh glosarium (.txt)",
+                                        _safe_txt(_mem),
+                                        file_name=f"{_book_id}.glossary.txt",
+                                        help="Hanya istilah approved yang boleh dibaca "
+                                             "sesuai Reader Progress.")
+                    _exp_full = _d1.checkbox("Ekspor lengkap (berisiko spoiler)",
+                                             key=_k("bm_exp_full"),
+                                             help="Sertakan SELURUH approved glossary, "
+                                                  "termasuk istilah dari bab yang belum dibaca.")
+                    if _exp_full:
+                        _exp = _bm_store.export_glossary_file(
+                            _book_id, Path(_tf.gettempdir()) / f"{_book_id}.glossary.txt")
+                        _d1.download_button("Unduh glosarium lengkap (.txt)",
+                                            _exp.read_text(encoding="utf-8"),
+                                            file_name=f"{_book_id}.glossary-full.txt")
                     _d1.caption("Format kompatibel dengan flag CLI `--glossary`.")
                     _up = _d2.file_uploader("Impor glosarium (.txt / .json)", type=["txt", "json"],
                                             disabled=running, key="bm_import")
@@ -628,6 +676,155 @@ with st.expander("Book Memory v0 — glosarium & catatan per buku", expanded=Fal
                                            f"dengan benar ({_res.units_checked} unit).")
                         except Exception as _e:
                             st.error(f"Gagal validasi: {_e}")
+                with _bm_tabs[5]:
+                    st.caption("Autonomous Glossary v1 — discovery kronologis per bab + verifikasi. "
+                               "Default OFF: translator tetap berfungsi normal tanpa fitur ini.")
+                    _v1d = st.checkbox("Automatic Glossary Discovery",
+                                        value=bool(st.session_state.get("v1_discovery", False)),
+                                        key="v1_discovery",
+                                        help="AI menemukan istilah baru tiap bab selesai diterjemahkan.")
+                    _v1v = st.checkbox("Automatic Verification",
+                                        value=bool(st.session_state.get("v1_verify", False)),
+                                        key="v1_verify",
+                                        help="Verifikasi semantik AI atas usulan terjemahan (wajib untuk Auto Safe).")
+                    _v1p = st.radio("Approval Policy", ["Review First", "Auto Safe"],
+                                    index=(1 if st.session_state.get("v1_policy") == "Auto Safe" else 0),
+                                    key="v1_policy",
+                                    help="Auto Safe bersifat opt-in dan konservatif (hanya nama diri "
+                                         "person/place yang lolos seluruh pemeriksaan).")
+                    # v2.6.0: injeksi catatan karakter per bab — strict opt-in,
+                    # default OFF agar baseline Book Memory v1 tidak tersentuh.
+                    _v1c = st.checkbox("Suntik Catatan Karakter per bab",
+                                        value=bool(st.session_state.get("v1_charnotes", False)),
+                                        key="v1_charnotes",
+                                        help="Menyuntikkan catatan karakter Book Memory (anti-spoiler "
+                                             "per bab) ke instruksi tiap bab. OFF = prompt byte-identik "
+                                             "dengan semula; ON = namespace cache baru.")
+                    st.divider()
+                    st.subheader("Reader Progress (anti-spoiler)")
+                    _rp = st.number_input("Bab terakhir yang sudah dibaca", min_value=0,
+                                          value=int(_mem.reader_progress or 0),
+                                          key=_k("v1_reader"),
+                                          help="Tampilan glossary menyembunyikan istilah dari bab sesudahnya. "
+                                               "0 = belum diatur (mode tertutup: hanya bab 1). "
+                                               "Angka selalu berarti nomor bab yang sebenarnya.")
+                    _show_all = st.checkbox("Tampilkan semua istilah (berisiko spoiler)",
+                                            value=bool(_mem.show_all_terms),
+                                            key=_k("v1_showall"),
+                                            help="Tindakan eksplisit untuk melihat seluruh glossary "
+                                                 "termasuk bab yang belum dibaca.")
+                    if st.button("Simpan Reader Progress", disabled=running, key=_k("v1_rp_save")):
+                        _rv = int(_rp)
+                        # 0 = belum diatur (fail-closed); angka lain = nomor bab sebenarnya.
+                        _mem.reader_progress = None if _rv == 0 else _rv
+                        _mem.show_all_terms = bool(_show_all)
+                        _bm_store.save(_mem)
+                        st.success(f"Reader Progress: {('belum diatur' if _rv == 0 else f'bab {_rv}')}"
+                                   f"{' + tampil semua' if _show_all else ''}.")
+                    st.divider()
+                    st.subheader("Statistik Discovery")
+                    _dlog = _mem.discovery_log or {}
+                    _done_ch = sorted((int(k) for k in _dlog if str(k).isdigit()))
+                    st.write(f"Bab terbit: {_mem.translation_progress} | "
+                             f"Bab dengan discovery: {len(_done_ch)}")
+                    _api = _mem.api_usage or {}
+                    for _kk, _vv in _api.items():
+                        st.write(f"API {_kk}: {_vv.get('requests', 0)} request, "
+                                 f"{_vv.get('tokens', 0):,} token")
+                    st.divider()
+                    st.subheader("Automatically Approved Terms")
+                    _auto_terms = [t for t in _mem.visible_terms()
+                                   if t.approved and t.origin == "auto"]
+                    if _auto_terms:
+                        st.dataframe([{"Istilah": t.term, "Terjemahan": t.translation,
+                                       "Bab": t.source_chapter or "-",
+                                       "Status": t.status} for t in _auto_terms],
+                                     use_container_width=True, hide_index=True)
+                    else:
+                        st.info("(belum ada)")
+                    st.subheader("Pending Review")
+                    _pend = _mem.pending_terms()
+                    # spoiler-safe fail-closed: gunakan visible_terms sebagai acuan
+                    _vis_ids = {id(t) for t in _mem.visible_terms()}
+                    _pend_vis = [t for t in _pend if id(t) in _vis_ids]
+                    if _pend_vis:
+                        _prows = [{"Istilah": t.term, "Terjemahan": t.translation,
+                                   "Status": t.status, "Bab": t.source_chapter or "-",
+                                   "Catatan": (t.note or "")[:80],
+                                   # v2.6.0: saran koreksi AI Verifier (tidak auto-apply)
+                                   "Saran AI": t.suggested_fix or "-",
+                                   "Setujui": False} for t in _pend_vis]
+                        _pedit = st.data_editor(
+                            _prows, key=_k("v1_pending"),
+                            column_config={"Setujui": st.column_config.CheckboxColumn(),
+                                           "Saran AI": st.column_config.TextColumn(disabled=True)},
+                            disabled=running, hide_index=True)
+                        _prec = _pedit.to_dict("records") if hasattr(_pedit, "to_dict") else list(_pedit)
+                        _pc1, _pc2, _pc3 = st.columns(3)
+                        if _pc1.button("Setujui yang dicentang", disabled=running,
+                                       key=_k("v1_approve")):
+                            from novel_translator.book_memory import _now as _bm_now
+                            _approved_n = 0
+                            for _r in _prec:
+                                if _r.get("Setujui"):
+                                    for _t in _mem.terms:
+                                        if _t.term == _r.get("Istilah") and not _t.approved:
+                                            _t.record_change(by="user")
+                                            _t.approved = True
+                                            _t.status = "verified"
+                                            _t.origin = "manual"
+                                            _t.updated_at = _bm_now()
+                                            _approved_n += 1
+                            _bm_store.save(_mem)
+                            st.success(f"Disetujui: {_approved_n} istilah.")
+                        if _pc2.button("Tolak yang dicentang", disabled=running,
+                                       key=_k("v1_reject")):
+                            from novel_translator.book_memory import _now as _bm_now2
+                            _rejected_n = 0
+                            for _r in _prec:
+                                if _r.get("Setujui"):
+                                    for _t in _mem.terms:
+                                        if _t.term == _r.get("Istilah") and not _t.approved:
+                                            _t.record_change(by="user")
+                                            _t.status = "rejected"
+                                            _t.updated_at = _bm_now2()
+                                            _rejected_n += 1
+                                    _key = " ".join(str(_r.get("Istilah") or "").split()).casefold()
+                                    if _key and _key not in _mem.rejected_terms:
+                                        _mem.rejected_terms.append(_key)
+                            # istilah rejected tetap tersimpan (audit trail),
+                            # tetapi tidak muncul di pending review
+                            _bm_store.save(_mem)
+                            st.success(f"Ditolak: {_rejected_n} istilah (tidak diusulkan ulang otomatis).")
+                        # v2.6.0: pakai saran koreksi AI Verifier (satu klik).
+                        # Hanya mengganti terjemahan usulan; TIDAK menyetujui —
+                        # user tetap mencentang "Setujui" secara terpisah.
+                        if _pc3.button("Pakai saran AI yang dicentang", disabled=running,
+                                       key=_k("v1_use_suggestion")):
+                            from novel_translator.book_memory import _now as _bm_now3
+                            _used_n = 0
+                            for _r in _prec:
+                                if _r.get("Setujui"):
+                                    for _t in _mem.terms:
+                                        if (_t.term == _r.get("Istilah") and not _t.approved
+                                                and _t.suggested_fix):
+                                            _t.record_change(by="user")
+                                            _t.translation = _t.suggested_fix
+                                            _t.suggested_fix = ""
+                                            _t.updated_at = _bm_now3()
+                                            _used_n += 1
+                            _bm_store.save(_mem)
+                            st.success(f"Saran AI dipakai: {_used_n} istilah "
+                                       f"(terjemahan diperbarui, belum disetujui).")
+                    else:
+                        st.info("(tidak ada pending review)")
+                    st.subheader("Konflik")
+                    _vconf = detect_conflicts(_mem.visible_terms())
+                    if _vconf:
+                        for _c in _vconf:
+                            st.warning(f"[{_c.kind}] {_c.message}")
+                    else:
+                        st.success("Tidak ada konflik pada istilah yang tampil.")
 
 if st.button("Mulai / lanjutkan", type="primary", disabled=running or uploaded is None):
     try:
@@ -640,6 +837,13 @@ if st.button("Mulai / lanjutkan", type="primary", disabled=running or uploaded i
                                      skill_profile=skill_profile,
                                      ignore_cache=regen,
                                      glossary=parse_glossary(glossary_raw), custom_instruction=instruction,
+                                     # Book Memory v1 (default OFF)
+                                     auto_glossary=bool(st.session_state.get("v1_discovery", False)),
+                                     auto_verify=bool(st.session_state.get("v1_verify", False)),
+                                     approval_policy=("auto_safe" if st.session_state.get("v1_policy") == "Auto Safe"
+                                                      else "review_first"),
+                                     # v2.6.0: strict opt-in, default OFF
+                                     character_notes=bool(st.session_state.get("v1_charnotes", False)),
                                      max_requests=max_requests, rpm=rpm, tpm=tpm, rpd=rpd,
                                      official_rpd=official_rpd, target_tpm=target_tpm,
                                      target_input_tokens=target_input, max_input_tokens=max_input, workers=workers,
@@ -770,7 +974,7 @@ def job_panel():
 job_panel()
 st.divider()
 st.markdown(
-    '<p class="footer-note">Versi 2.4.1 · Aplikasi lokal. Pemeriksaan format tidak menjamin akurasi bahasa; '
+    '<p class="footer-note">Versi 2.6.0 · Aplikasi lokal. Pemeriksaan format tidak menjamin akurasi bahasa; '
     "periksa sampel hasil dan istilah penting.</p>",
     unsafe_allow_html=True,
 )
