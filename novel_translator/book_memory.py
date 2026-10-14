@@ -22,7 +22,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields as _dc_fields
 from pathlib import Path
 
 from .storage import atomic_bytes
@@ -38,16 +38,12 @@ def _now() -> str:
 
 
 def epub_text_blocks(epub_path: str | Path) -> list[str]:
-    """LEGASI: ekstraksi blok via regex — TIDAK dipakai validasi lagi.
-
-    Digantikan validate_epub_pair() yang memakai EpubBook di kedua sisi.
-    Dipertahankan agar tidak merusak pemanggil eksternal; jangan pakai untuk
-    penjajaran sumber<->hasil (pernah meleset: 9 unit vs 8 blok).
-    """
     """Ambil semua blok teks (judul + paragraf) sebuah EPUB sesuai urutan dokumen.
 
-    Dipakai untuk penjajaran sumber<->hasil yang robust: unit judul ikut
-    dihitung agar tidak terjadi off-by-one.
+    LEGASI: tidak dipakai validasi lagi — digantikan validate_epub_pair()
+    yang memakai EpubBook di kedua sisi. Dipertahankan agar tidak merusak
+    pemanggil eksternal; jangan pakai untuk penjajaran sumber<->hasil
+    (pernah meleset: 9 unit vs 8 blok).
     """
     import zipfile as _zipfile
     z = _zipfile.ZipFile(str(epub_path))
@@ -205,9 +201,29 @@ class GlossaryTerm:
     approved: bool = True
     note: str = ""
     updated_at: str = field(default_factory=_now)
+    # --- Book Memory v1 (autonomous glossary) ---
+    # status: "verified" | "provisional" | "ambiguous" | "rejected"
+    status: str = "verified"
+    # origin: "manual" | "auto" (Auto Safe) — manual selalu menang
+    origin: str = "manual"
+    # bab tempat istilah ditemukan (1-based, sesuai urutan spine)
+    source_chapter: int | None = None
+    # kutipan bukti dari teks sumber
+    evidence: str = ""
+    # v2.6.0: saran koreksi dari AI Verifier — TIDAK PERNAH diterapkan otomatis.
+    # Hanya ditampilkan di UI review; user yang memutuskan memakainya.
+    suggested_fix: str = ""
+    # riwayat perubahan: [{translation, approved, status, at, by}]
+    history: list = field(default_factory=list)
 
     def normalized(self) -> str:
         return _norm_term(self.term)
+
+    def record_change(self, by: str = "system") -> None:
+        """Catat status saat ini ke riwayat sebelum diubah."""
+        self.history.append({
+            "translation": self.translation, "approved": self.approved,
+            "status": self.status, "at": _now(), "by": by})
 
 
 @dataclass
@@ -236,6 +252,27 @@ class BookMemory:
     terms: list[GlossaryTerm] = field(default_factory=list)
     characters: list[CharacterNote] = field(default_factory=list)
     version: int = BOOK_MEMORY_VERSION
+    # --- Book Memory v1 ---
+    # translation_progress: jumlah bab yang SUDAH diterjemahkan (per spine order)
+    translation_progress: int = 0
+    # reader_progress: bab terakhir yang dibaca user (None = belum diatur)
+    reader_progress: int | None = None
+    # show_all_terms: True bila user eksplisit memilih tampil semua (fail-closed off)
+    show_all_terms: bool = False
+    # istilah yang ditolak user (normalized) — tidak diusulkan ulang otomatis
+    rejected_terms: list[str] = field(default_factory=list)
+    # log discovery per bab: {chapter_index: {status, n_terms, api_tokens, at}}
+    discovery_log: dict = field(default_factory=dict)
+    # akumulasi pemakaian API glossary: {"discovery": {tokens, requests}, ...}
+    api_usage: dict = field(default_factory=dict)
+    # v2.6.0 selective re-translation: namespace cache terakhir per bab.
+    # {str(ch_idx): {"job_id": ch_job_id, "ghash": glossary_fingerprint,
+    #                "config_id": config_id}}
+    chapter_namespaces: dict = field(default_factory=dict)
+    # snapshot glossary efektif per hash (dedup: glossary sering identik
+    # antar-bab, hanya berubah saat user menyetujui/mengubah istilah)
+    # {ghash: {term: translation}}
+    glossary_snapshots: dict = field(default_factory=dict)
 
     def glossary_dict(self, approved_only: bool = True) -> dict[str, str]:
         """Dict siap pakai untuk ``TranslationOptions.glossary``."""
@@ -246,6 +283,57 @@ class BookMemory:
             if t.term and t.translation and t.term not in result:
                 result[t.term] = t.translation
         return result
+
+    def glossary_upto_chapter(self, chapter: int) -> dict[str, str]:
+        """Glosarium approved yang dikenal s.d. bab ``chapter`` (1-based).
+
+        Fondasi chronological learning: bab N hanya memakai istilah dari
+        bab < N (istilah bab N sendiri baru tersedia untuk bab N+1).
+        Istilah tanpa source_chapter (manual lama) selalu ikut.
+        """
+        result = {}
+        for t in self.terms:
+            if not t.approved or not t.term or not t.translation:
+                continue
+            if t.source_chapter is not None and t.source_chapter >= chapter:
+                continue
+            if t.term not in result:
+                result[t.term] = t.translation
+        return result
+
+    def pending_terms(self) -> list[GlossaryTerm]:
+        """Kandidat menunggu review: tidak approved & tidak rejected."""
+        rejected = set(self.rejected_terms)
+        return [t for t in self.terms
+                if not t.approved and t.status != "rejected"
+                and t.normalized() not in rejected]
+
+    def visible_terms(self) -> list[GlossaryTerm]:
+        """Istilah yang boleh ditampilkan di UI (spoiler-safe, fail-closed).
+
+        Bila show_all_terms True (pilihan eksplisit user), tampilkan semua.
+        Bila reader_progress diset, istilah dari bab sesudahnya disembunyikan.
+        Bila BELUM diset (None) dan sudah ada istilah dari bab > 1, default
+        tertutup: hanya tampilkan sampai bab 1.
+        Istilah manual tanpa source_chapter selalu tampil.
+        """
+        if self.show_all_terms:
+            return list(self.terms)
+        limit = self.reader_progress
+        if limit is None:
+            # Fail-closed: jangan tampilkan masa depan sebelum pengguna memilih.
+            future = [t for t in self.terms
+                      if t.source_chapter is not None and t.source_chapter > 1]
+            limit = 1 if future else None
+        if limit is None:
+            return list(self.terms)
+        return [t for t in self.terms
+                if t.source_chapter is None or t.source_chapter <= limit]
+
+    def record_api_usage(self, kind: str, tokens: int, requests: int = 1) -> None:
+        entry = self.api_usage.setdefault(kind, {"tokens": 0, "requests": 0})
+        entry["tokens"] += tokens
+        entry["requests"] += requests
 
     def character_block(self, max_chars: int = CHARACTER_BLOCK_MAX_CHARS,
                           chapter: int | None = None) -> str:
@@ -306,11 +394,17 @@ def detect_conflicts(terms: list[GlossaryTerm]) -> list[Conflict]:
         else:
             seen[key] = t
     keys = list(seen)
+    # v2.6.0: pre-compile pola word-boundary sekali per istilah; cukup uji
+    # istilah yang lebih pendek di dalam yang lebih panjang (satu arah).
+    # Ekuivalen dengan dua arah versi lama: bila len(a) <= len(b), pola b
+    # tak mungkin cocok di dalam a (kunci unik, panjang pola > teks).
+    patterns = {k: re.compile(r"(?<!\w)" + re.escape(k) + r"(?!\w)")
+                for k in keys}
     for i, a in enumerate(keys):
         for b in keys[i + 1:]:
             # overlap: satu istilah menjadi frasa di dalam istilah lain
-            if re.search(r"(?<!\w)" + re.escape(a) + r"(?!\w)", b) or \
-               re.search(r"(?<!\w)" + re.escape(b) + r"(?!\w)", a):
+            short, long = (a, b) if len(a) <= len(b) else (b, a)
+            if patterns[short].search(long):
                 conflicts.append(Conflict(
                     "overlap", [seen[a].term, seen[b].term],
                     f"Istilah tumpang tindih: '{seen[a].term}' vs '{seen[b].term}'. "
@@ -318,11 +412,23 @@ def detect_conflicts(terms: list[GlossaryTerm]) -> list[Conflict]:
     return conflicts
 
 
+def _future_proof(cls, data: dict):
+    """Bangun dataclass dari dict JSON sambil mengabaikan atribut tak dikenal.
+
+    v2.5.2: ekspansi langsung ``cls(**data)`` meledak dengan TypeError bila
+    file JSON dari versi lebih baru membawa atribut tambahan.
+    """
+    allowed = {f.name for f in _dc_fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in allowed})
+
+
 class BookMemoryStore:
     """Penyimpanan JSON per buku, atomic write, tanpa dependensi baru."""
 
-    def __init__(self, root: str | Path = DEFAULT_ROOT):
-        self.root = Path(root)
+    def __init__(self, root: str | Path | None = None):
+        # root=None -> DEFAULT_ROOT (dievaluasi saat dipanggil, bukan saat
+        # definisi, agar pengujian dapat mengisolasi via monkeypatch).
+        self.root = Path(root) if root is not None else Path(DEFAULT_ROOT)
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, book_id: str) -> Path:
@@ -337,15 +443,33 @@ class BookMemoryStore:
         return BookMemory(
             book_id=data.get("book_id", book_id),
             title=data.get("title", ""),
-            terms=[GlossaryTerm(**t) for t in data.get("terms", [])],
-            characters=[CharacterNote(**c) for c in data.get("characters", [])],
-            version=data.get("version", 1))
+            terms=[_future_proof(GlossaryTerm, t) for t in data.get("terms", [])],
+            characters=[_future_proof(CharacterNote, c)
+                        for c in data.get("characters", [])],
+            version=data.get("version", 1),
+            translation_progress=data.get("translation_progress", 0),
+            reader_progress=data.get("reader_progress"),
+            show_all_terms=bool(data.get("show_all_terms", False)),
+            rejected_terms=data.get("rejected_terms", []),
+            discovery_log=data.get("discovery_log", {}),
+            api_usage=data.get("api_usage", {}),
+            chapter_namespaces=data.get("chapter_namespaces", {}),
+            glossary_snapshots=data.get("glossary_snapshots", {}))
 
     def save(self, memory: BookMemory) -> None:
         payload = {"book_id": memory.book_id, "title": memory.title,
                    "version": BOOK_MEMORY_VERSION,
                    "terms": [asdict(t) for t in memory.terms],
-                   "characters": [asdict(c) for c in memory.characters]}
+                   "characters": [asdict(c) for c in memory.characters],
+                   "translation_progress": memory.translation_progress,
+                   "reader_progress": memory.reader_progress,
+                   "show_all_terms": memory.show_all_terms,
+                   "rejected_terms": memory.rejected_terms,
+                   "discovery_log": memory.discovery_log,
+                   "api_usage": memory.api_usage,
+                   # v2.6.0 selective re-translation
+                   "chapter_namespaces": memory.chapter_namespaces,
+                   "glossary_snapshots": memory.glossary_snapshots}
         atomic_bytes(self._path(memory.book_id),
                      json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8"),
                      overwrite=True)
@@ -366,12 +490,29 @@ class BookMemoryStore:
     def export_glossary_file(self, book_id: str, dest: str | Path,
                              approved_only: bool = True) -> Path:
         """Tulis format ``Inggris = Indonesia`` per baris — kompatibel
-        dengan flag CLI ``--glossary`` yang sudah ada."""
+        dengan flag CLI ``--glossary`` yang sudah ada.
+
+        CATATAN: metode ini mengekspor SELURUH glossary (untuk CLI/API).
+        Untuk ekspor UI yang spoiler-safe, pakai
+        ``spoiler_safe_glossary_text()``.
+        """
         memory = self.load(book_id)
         lines = [f"{k} = {v}" for k, v in memory.glossary_dict(approved_only).items()]
         dest = Path(dest)
         atomic_bytes(dest, ("\n".join(lines) + "\n").encode("utf-8"), overwrite=True)
         return dest
+
+
+def spoiler_safe_glossary_text(memory: BookMemory) -> str:
+    """Teks glossary untuk unduhan UI yang aman dari spoiler.
+
+    Hanya memuat istilah approved yang diizinkan oleh Reader Progress
+    (via ``visible_terms()``). Untuk ekspor lengkap, pengguna harus
+    memilih eksplisit lewat kontrol terpisah di UI.
+    """
+    terms = [t for t in memory.visible_terms()
+             if t.approved and t.term and t.translation]
+    return "\n".join(f"{t.term} = {t.translation}" for t in terms) + "\n"
 
 
 def changed_terms(old: list[GlossaryTerm],
@@ -410,6 +551,31 @@ def units_affected_by_change(old_terms: list[GlossaryTerm], new_terms: list[Glos
         if any(p.search(text) for _, p in patterns):
             affected.append(unit.id)
     return affected
+
+
+def glossary_fingerprint(glossary: dict[str, str]) -> str:
+    """Hash deterministik glossary efektif (16 hex) untuk dedup snapshot."""
+    items = sorted((k.casefold(), v) for k, v in glossary.items() if k and v)
+    return hashlib.sha256(
+        json.dumps(items, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def split_inherited_units(old_glossary: dict[str, str], new_glossary: dict[str, str],
+                          units, old_targets: dict[str, str]
+                          ) -> tuple[dict[str, str], set[str]]:
+    """Pisahkan target lama menjadi (warisan, run_terdampak). Murni, tanpa I/O.
+
+    Warisan = run yang unit sumbernya TIDAK mengandung istilah yang
+    ditambah/dihapus/diubah -> aman disalin ke namespace bab baru.
+    Bila glossary identik, semua diwariskan dan himpunan terdampak kosong.
+    """
+    old_terms = [GlossaryTerm(term=k, translation=v) for k, v in old_glossary.items()]
+    new_terms = [GlossaryTerm(term=k, translation=v) for k, v in new_glossary.items()]
+    affected_units = set(units_affected_by_change(old_terms, new_terms, units))
+    affected_runs = {r.id for u in units if u.id in affected_units for r in u.runs}
+    inherited = {rid: txt for rid, txt in old_targets.items()
+                 if rid not in affected_runs}
+    return inherited, affected_runs
 
 
 @dataclass
@@ -519,7 +685,10 @@ def validate_epub_pair(source_epub: str | Path, output_epub: str | Path,
             return ValidationResult([], "unverifiable", f"gagal parse sumber: {e}")
         # Output pipeline bertanda xml:lang=target -> EpubBook menolak ekstrak;
         # normalisasi salinan sementara (struktur tidak berubah).
-        tmp_out = tempfile.NamedTemporaryFile(suffix=".epub", delete=False).name
+        # v2.5.2: tutup handle eksplisit via context manager — di Windows,
+        # handle yang mengambang membuat zipfile gagal (PermissionError).
+        with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as tmp:
+            tmp_out = tmp.name
         _strip_lang_for_validation(output_epub, tmp_out)
         try:
             ounits = EpubBook(tmp_out).units
