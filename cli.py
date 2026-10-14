@@ -17,6 +17,35 @@ from novel_translator.models import (DEFAULT_MODEL, DEFAULT_OA_BASE_URL, DEFAULT
 from novel_translator.openai_client import OpenAICompatibleTranslator
 
 
+def _cli_error_code(exc):
+    """Kode error machine-readable untuk CLI (aturan E4 ai-native-cli)."""
+    if isinstance(exc, FileNotFoundError):
+        return "INPUT_NOT_FOUND"
+    if isinstance(exc, PermissionError):
+        return "PERMISSION_DENIED"
+    if isinstance(exc, (UnicodeDecodeError, ValueError)):
+        return "INVALID_INPUT"
+    return "UNEXPECTED_ERROR"
+
+
+def _cli_error_suggestion(code):
+    """Saran perbaikan per kode error (aturan E1 ai-native-cli)."""
+    return {
+        "INPUT_NOT_FOUND": "Periksa path --input/--glossary/--instruction/--epubcheck-jar.",
+        "PERMISSION_DENIED": "Periksa izin baca/tulis pada path input, output, dan cache.",
+        "INVALID_INPUT": "Pastikan file glossary/instruksi berformat UTF-8 yang valid.",
+        "UNEXPECTED_ERROR": "Coba --inspect atau --offline untuk diagnosa tanpa API; periksa koneksi dan API key.",
+        "CONFIRMATION_REQUIRED": "Ulangi perintah dengan --fresh --yes bila memang disengaja.",
+    }.get(code, "")
+
+
+def _cli_fail(code, message):
+    """Cetak structured error ke stderr (aturan E1 ai-native-cli)."""
+    print(json.dumps({"error": True, "code": code, "message": message,
+                      "suggestion": _cli_error_suggestion(code)},
+                     ensure_ascii=False), file=sys.stderr)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Translator EPUB Inggris ke Indonesia (Gemini atau gateway OpenAI-compatible).")
     parser.add_argument("input", type=Path)
@@ -42,8 +71,16 @@ def main(argv=None):
     parser.add_argument("--style", default="Natural dan mengalir seperti novel Indonesia modern")
     parser.add_argument("--domain", choices=["fiction", "nonfiction"], default="fiction",
                         help="Domain terjemahan: fiksi (default) atau non-fiksi (instruksi akurasi fakta/istilah)")
+    parser.add_argument("--skill", choices=["off", "lean"], default="off",
+                        help="Webnovel Translation Skill: off (default, tanpa overhead) | "
+                             "lean (instruksi sastra ringkas per genre)")
+    parser.add_argument("--skill-profile", choices=["general", "xianxia", "progression", "mystery", "character"],
+                        default="general",
+                        help="Profil genre skill (efektif bila --skill lean)")
     parser.add_argument("--fresh", action="store_true",
                         help="Generate ulang dari nol: abaikan cache buku ini dan timpa output")
+    parser.add_argument("--yes", action="store_true",
+                        help="Konfirmasi operasi destruktif; wajib dipakai bersama --fresh")
     parser.add_argument("--chunk-chars", type=int, default=8000, help="Kompatibilitas v2.0; diabaikan, gunakan --input-tokens")
     parser.add_argument("--mode", choices=list(PROFILES), default="Aggressive")
     parser.add_argument("--input-tokens", type=int)
@@ -68,6 +105,13 @@ def main(argv=None):
     parser.add_argument("--epubcheck-jar", type=Path, help="Opsional: EPUBCheck sebagai gate sebelum publikasi")
     parser.add_argument("--offline", action="store_true", help="Ekspor hanya jika cache sudah lengkap; tanpa key")
     args = parser.parse_args(argv)
+
+    # S1 (ai-native-cli): --fresh membuang seluruh cache -> butuh konfirmasi eksplisit.
+    # --inspect tidak menyentuh cache sehingga dikecualikan.
+    if args.fresh and not args.yes and not args.inspect:
+        _cli_fail("CONFIRMATION_REQUIRED",
+                  "--fresh membuang seluruh cache buku ini dan menerjemahkan ulang dari nol.")
+        return 2
 
     def split_keys(raw):
         parts = []
@@ -116,6 +160,7 @@ def main(argv=None):
             provider=args.provider, oa_base_url=args.oa_base_url, oa_token_budget=args.oa_token_budget,
             cache_dir=args.cache_dir,
             style=args.style, domain=args.domain, ignore_cache=args.fresh, chunk_chars=args.chunk_chars, max_requests=args.max_requests,
+            skill=args.skill, skill_profile=args.skill_profile,
             rpm=setting("rpm", args.rpm), tpm=setting("tpm", args.tpm), rpd=setting("rpd", args.rpd), delay_seconds=args.delay,
             target_tpm=setting("target_tpm", args.target_tpm), target_input_tokens=setting("target_input_tokens", args.input_tokens),
             max_input_tokens=setting("max_input_tokens", args.max_input_tokens), workers=setting("workers", args.workers),
@@ -128,7 +173,8 @@ def main(argv=None):
         output = args.output or args.input.with_name(args.input.stem + "_Indonesia.epub")
 
         def progress(done, total, requests, message):
-            print(f"[{done}/{total} | request {requests}] {message}", flush=True)
+            # C1/C2 (ai-native-cli): stdout hanya untuk data; progress ke stderr.
+            print(f"[{done}/{total} | request {requests}] {message}", flush=True, file=sys.stderr)
 
         factory = OpenAICompatibleTranslator if args.provider == "openai" else None
         result = translate_novel(args.input, output, options, progress=progress, cancel_event=event,
@@ -141,7 +187,8 @@ def main(argv=None):
             return 0
         return 3
     except Exception as exc:
-        print("Gagal: " + safe_error(exc, keys), file=sys.stderr)
+        code = _cli_error_code(exc)
+        _cli_fail(code, safe_error(exc, keys))
         return 1
     finally:
         signal.signal(signal.SIGINT, previous)

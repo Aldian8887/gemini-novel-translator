@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.6.0 — Book Memory v1.1: optimasi, saran verifier, selective re-translation, character notes opt-in (14 Okt 2026)
+
+- `book_memory.py`: `detect_conflicts()` pre-compile regex word-boundary sekali per istilah + uji satu arah (82x lebih cepat, hasil identik); field baru `GlossaryTerm.suggested_fix` (default `""`, tidak pernah auto-apply); `BookMemory.chapter_namespaces` + `glossary_snapshots` untuk selective re-translation; helper `glossary_fingerprint()` & `split_inherited_units()`.
+- `glossary_auto.py`: `run_chapter_discovery()` menyimpan `corrected_translation` verifier ke `suggested_fix`.
+- `pipeline.py`: selective re-translation — bila namespace bab berubah HANYA karena glossary, unit tak-terdampak diwariskan dari namespace lama (guard `config_id`: ganti model/style/domain/skill tetap retranslate penuh); `ProgressMetrics.inherit()` menjaga akurasi metrik tanpa inflasi request.
+- `models.py` + `token_budget.py`: opsi `character_notes` (default `False`, strict opt-in); OFF = `settings()`/prompt byte-identik; ON = flag masuk identitas cache + `PromptBuilder` disuntik `mem.character_block(chapter=...)` anti-spoiler per bab.
+- `app.py`: kolom "Saran AI" + tombol "Pakai saran AI yang dicentang" di Pending Review; checkbox "Suntik Catatan Karakter per bab" (default OFF).
+- Test: 210/210 hijau (19 test baru: ekuivalensi konflik, performa, partisi warisan, guard config_id, e2e retranslation parsial, e2e anti-spoiler character notes).
+- Mesin terjemahan inti tidak berubah: ENGINE_VERSION=2.0.0, PROMPT_VERSION=2.
+
+## 2.5.2 — hotfix audit Argon: transport, validator, lifecycle, file hygiene (14 Okt 2026)
+
+- `pipeline.py`: translator per bab kini ditutup segera setelah `drain()` bab selesai (sebelumnya pool koneksi menumpuk hingga akhir buku); `translate_novel` otomatis memilih `OpenAICompatibleTranslator` bila `translator_factory` masih default dan `options.provider == "openai"`.
+- `glossary_auto.py`: `GlossaryAIClient.complete_json` selaras `openai_client.py` — User-Agent ala browser, satu `httpx.Client` per panggilan, fallback hapus `response_format` saat gateway membalas HTTP 400, deteksi error berbalut HTTP 200, dan watchdog `--oa-token-budget` (Paused bersih saat anggaran tercapai).
+- `glossary_auto.py`: validator R2/R3/R6 memakai pencocokan level token (bukan substring mentah — `"tn"`/`"dr"` tidak lagi lolos di kata acak); `discover()` memotong teks pada batas paragraf `\n\n` terdekat.
+- `book_memory.py`: handle tempfile di `validate_epub_pair` ditutup eksplisit (aman di Windows); `BookMemoryStore.load` tahan skema JSON masa depan via `_future_proof()`; docstring ganda `epub_text_blocks` digabung.
+- Mesin terjemahan tidak berubah: ENGINE_VERSION=2.0.0, PROMPT_VERSION=2; Book Memory v1 tetap baseline stabil; 191/191 pytest hijau.
+
+## 2.5.1 — hardening CLI, UI/UX batch 1, dan testing audit (12 Okt 2026)
+
+- CLI agent-friendly (P0): progress ke stderr, error JSON terstruktur ke stderr (kode INPUT_NOT_FOUND/PERMISSION_DENIED/INVALID_INPUT/UNEXPECTED_ERROR), `--fresh` wajib `--yes` kecuali `--inspect`.
+- UI/UX batch 1: kontras `.footer-note` #78716C -> #A8A29E (WCAG AA 7,49:1), hapus emoji `page_icon`.
+- Testing audit: coverage 55% -> 74%; `openai_client.py` 0% -> 91% (45 test mock), `rate_limit.py` 33% -> 92% (26 test), `gemini_client.py` 23% -> 88% (44 test); `tests/conftest.py` + markers pytest (unit/integration/slow) + 10 property-based test hypothesis untuk invarian glossary (anti-spoiler known_from, dedup, konflik).
+- Mesin terjemahan tidak berubah: ENGINE_VERSION=2.0.0, PROMPT_VERSION=2; Book Memory v1 tetap baseline stabil.
+
 ## 2.4.1 — hemat token jalur gateway (OpenAI-compatible)
 
 - Khusus provider "openai": batas output per model gateway (claude-sonnet-4-5 dan qwen-3-8-max: 32.768 token/batch), alias ID pendek u0../r0.. di lapisan transport (dipetakan kembali sebelum validasi), dan watchdog anggaran token sesi `--oa-token-budget` yang berhenti bersih sebelum anggaran terlampaui. Lihat `PATCH_NOTES_2.4.1.md`.

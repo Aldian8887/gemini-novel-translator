@@ -132,6 +132,7 @@ def workdir(tmp_path, monkeypatch):
     return tmp_path, src
 
 
+@pytest.mark.integration
 def test_chronological_learning_e2e(workdir):
     tmp_path, src = workdir
     out = tmp_path / "out.epub"
@@ -168,6 +169,7 @@ def test_chronological_learning_e2e(workdir):
     assert len(names) == len(set(names)), names
 
 
+@pytest.mark.integration
 def test_manual_glossary_wins_and_review_first(workdir):
     tmp_path, src = workdir
     out = tmp_path / "out2.epub"
@@ -188,6 +190,7 @@ def test_manual_glossary_wins_and_review_first(workdir):
     assert not [t for t in mem.terms if t.origin == "auto" and t.approved]
 
 
+@pytest.mark.integration
 def test_cancel_resume_no_duplicates(workdir):
     tmp_path, src = workdir
     out = tmp_path / "out3.epub"
@@ -233,6 +236,7 @@ def test_cancel_resume_no_duplicates(workdir):
         FakeAI.discover = orig_discover
 
 
+@pytest.mark.integration
 def test_legacy_path_unaffected(workdir):
     tmp_path, src = workdir
     out = tmp_path / "out4.epub"
@@ -241,3 +245,124 @@ def test_legacy_path_unaffected(workdir):
     assert res.complete
     # satu translator untuk seluruh buku (bukan per bab)
     assert len(FakeTranslator.glossaries_seen) == 1
+
+
+@pytest.mark.integration
+def test_selective_retranslation_only_affected_units(workdir):
+    """Langkah 3 v2.6.0: ubah glossary manual -> hanya unit yang sumbernya
+    mengandung istilah berubah yang diterjemahkan ulang; sisanya diwariskan
+    dari namespace lama (guard config_id tetap mengizinkan karena hanya
+    glossary yang berubah)."""
+    tmp_path, src = workdir
+
+    seen_batches = []  # [(unit_id, run_id, source_text)]
+
+    class CountingTranslator(FakeTranslator):
+        def translate_batch(self, batch):
+            for u in batch:
+                for r in u.runs:
+                    seen_batches.append((u.id, r.id, r.text))
+            return super().translate_batch(batch)
+
+    out1 = tmp_path / "out_sel1.epub"
+    res1 = translate_novel(src, out1, _options(),
+                           translator_factory=CountingTranslator,
+                           glossary_ai_factory=FakeAI)
+    assert res1.complete, res1.message
+    run1_units = {uid for uid, _, _ in seen_batches}
+    assert run1_units, "run 1 harus menerjemahkan semua"
+
+    # "Cronenberg" muncul di bab 1 & 3 -> ubah padanannya via glossary manual.
+    seen_batches.clear()
+    out2 = tmp_path / "out_sel2.epub"
+    res2 = translate_novel(src, out2,
+                           _options(glossary={"Cronenberg": "Kronenberg"}),
+                           translator_factory=CountingTranslator,
+                           glossary_ai_factory=FakeAI)
+    assert res2.complete, res2.message
+    assert seen_batches, "run 2 harus menerjemahkan ulang unit terdampak"
+    run2_units = {uid for uid, _, _ in seen_batches}
+    assert run2_units < run1_units, \
+        f"harus parsial, bukan penuh: {len(run2_units)} vs {len(run1_units)} unit"
+    # setiap unit yang diterjemahkan ulang harus mengandung "Cronenberg"
+    # (granularity = unit: judul satu unit dengan paragraf ikut serta)
+    by_unit = {}
+    for uid, rid, text in seen_batches:
+        by_unit.setdefault(uid, []).append(text)
+    for uid, texts in by_unit.items():
+        assert any("cronenberg" in t.casefold() for t in texts), uid
+    assert any(uid not in run2_units for uid in run1_units), \
+        "harus ada unit yang diwariskan tanpa API call"
+
+
+@pytest.mark.integration
+def test_selective_retranslation_blocked_on_model_change(workdir):
+    """Guard config_id: ganti model (tanpa ubah glossary) -> retranslate penuh,
+    tidak ada warisan antar-model."""
+    tmp_path, src = workdir
+
+    seen_batches = []
+
+    class CountingTranslator(FakeTranslator):
+        def translate_batch(self, batch):
+            for u in batch:
+                for r in u.runs:
+                    seen_batches.append(r.id)
+            return super().translate_batch(batch)
+
+    out1 = tmp_path / "out_cfg1.epub"
+    res1 = translate_novel(src, out1, _options(),
+                           translator_factory=CountingTranslator,
+                           glossary_ai_factory=FakeAI)
+    assert res1.complete
+    n1 = len(seen_batches)
+
+    seen_batches.clear()
+    out2 = tmp_path / "out_cfg2.epub"
+    res2 = translate_novel(src, out2, _options(model="gemini-3.1-flash-lite"),
+                           translator_factory=CountingTranslator,
+                           glossary_ai_factory=FakeAI)
+    assert res2.complete
+    # model berbeda -> config_id berbeda -> warisan diblokir -> penuh lagi
+    assert len(seen_batches) == n1, \
+        f"harusnya retranslate penuh: {len(seen_batches)} vs {n1}"
+
+
+@pytest.mark.integration
+def test_character_notes_injected_per_chapter_antispoiler(workdir):
+    """Langkah 4 v2.6.0: character_notes=True -> tiap bab disuntik blok catatan
+    (anti-spoiler: known_from bab 2 tidak muncul di bab 1); OFF -> kosong."""
+    from novel_translator.book_memory import CharacterNote
+    tmp_path, src = workdir
+    store = BookMemoryStore()
+    mem = store.load(compute_book_id(src))
+    mem.characters.append(CharacterNote(name="Toto", title="Tuan",
+                                        known_from="bab 1"))
+    mem.characters.append(CharacterNote(name="Wu-Lin", title="Nona",
+                                        known_from="bab 2"))
+    store.save(mem)
+
+    from novel_translator import token_budget as _tb
+    seen = []
+    orig_init = _tb.PromptBuilder.__init__
+
+    def spy(self, options, chapter_notes=""):
+        seen.append(chapter_notes)
+        orig_init(self, options, chapter_notes=chapter_notes)
+
+    _tb.PromptBuilder.__init__ = spy
+    try:
+        out = tmp_path / "out_cn.epub"
+        res = translate_novel(src, out,
+                              _options(auto_glossary=True, character_notes=True),
+                              translator_factory=FakeTranslator,
+                              glossary_ai_factory=FakeAI)
+    finally:
+        _tb.PromptBuilder.__init__ = orig_init
+    assert res.complete, res.message
+    assert len(seen) >= 3, f"PromptBuilder dibangun per bab: {len(seen)}"
+    assert all(seen), "setiap bab harus dapat blok catatan"
+    assert any("Toto" in s for s in seen)
+    # anti-spoiler: bab 1 (konstruksi pertama, kronologis) tak kenal Wu-Lin
+    assert "Wu-Lin" not in seen[0], seen[0]
+    assert any("Wu-Lin" in s for s in seen[1:])
