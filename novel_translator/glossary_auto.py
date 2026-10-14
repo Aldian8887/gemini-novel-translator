@@ -9,6 +9,7 @@ tetap lewat ``TranslationOptions.glossary`` seperti glossary manual.
 """
 from __future__ import annotations
 
+import httpx
 import json
 import re
 import time
@@ -20,6 +21,8 @@ from .book_memory import (
     BookMemory, BookMemoryStore, GlossaryTerm, _now,
     detect_conflicts, term_pattern,
 )
+from .errors import Paused
+from .openai_client import USER_AGENT
 from .storage import check_cancel
 
 # Batas teks discovery per bab agar request tetap dalam anggaran.
@@ -99,13 +102,14 @@ class GlossaryAIClient:
         self.status = status
         self.tokens_used = 0
         self.requests_made = 0
+        # v2.5.2: watchdog anggaran token provider (selaras oa_token_budget).
+        self._budget = max(0, int(getattr(options, "oa_token_budget", 0) or 0))
 
     def _estimate(self, text: str) -> int:
         return max(64, len(text) // 4)
 
     def complete_json(self, prompt: str, max_output: int = 8192) -> tuple[dict, int, int]:
         """Kirim prompt, kembalikan (parsed_json, in_tokens, out_tokens)."""
-        import httpx
         check_cancel(self.cancel_event)
         estimated = self._estimate(prompt)
         provider = getattr(self.options, "provider", "gemini")
@@ -116,7 +120,6 @@ class GlossaryAIClient:
                     "generationConfig": {"maxOutputTokens": max_output,
                                          "temperature": 0.1,
                                          "responseMimeType": "application/json"}}
-            headers = {"Content-Type": "application/json"}
             key_header = lambda k: {"x-goog-api-key": k}
         else:
             base = (getattr(self.options, "oa_base_url", "") or "").rstrip("/")
@@ -125,31 +128,68 @@ class GlossaryAIClient:
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.1, "max_tokens": max_output,
                     "response_format": {"type": "json_object"}}
-            headers = {"Content-Type": "application/json"}
             key_header = lambda k: {"Authorization": f"Bearer {k}"}
+        # v2.5.2: selaras OpenAICompatibleTranslator — User-Agent ala browser
+        # (menembus proteksi Cloudflare gateway) untuk kedua provider.
+        headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
 
         last = None
-        for attempt in range(3):
-            check_cancel(self.cancel_event)
-            with self.limiter.request(estimated) as reservation:
-                key = self.limiter.pinned_key(reservation)
-                try:
-                    with httpx.Client(timeout=120) as client:
+        rf_retry = False
+        # v2.5.2: satu httpx.Client per panggilan (sebelumnya baru per percobaan).
+        with httpx.Client(timeout=120) as client:
+            for attempt in range(3):
+                check_cancel(self.cancel_event)
+                # v2.5.2: watchdog anggaran token provider.
+                if self._budget and self.tokens_used + estimated > self._budget:
+                    raise Paused(
+                        f"Anggaran token sesi provider tercapai (~{self.tokens_used:,} "
+                        f"dari {self._budget:,} token). Progres tersimpan; naikkan "
+                        "--oa-token-budget atau lanjutkan setelah kuota reset.")
+                with self.limiter.request(estimated) as reservation:
+                    key = self.limiter.pinned_key(reservation)
+                    try:
                         resp = client.post(url, json=body,
                                            headers={**headers, **key_header(key)})
-                except Exception as exc:
-                    last = exc
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                if resp.status_code == 429:
-                    self.limiter.cooldown(15, key=key)
-                    last = RuntimeError("rate limited (429)")
-                    time.sleep(5 * (attempt + 1))
-                    continue
-                if resp.status_code >= 400:
-                    raise RuntimeError(f"Glossary AI HTTP {resp.status_code}")
-                parsed = resp.json()
-                # Rekonsiliasi usage SEBELUM parsing konten: HTTP 200 berarti
+                    except Exception as exc:
+                        last = exc
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    parsed = None
+                    try:
+                        parsed = resp.json()
+                    except ValueError:
+                        parsed = {}
+                    code = resp.status_code
+                    # v2.5.2: deteksi error berbalut HTTP 200 (selaras openai_client):
+                    # klasifikasikan dari kode error-nya tanpa menampilkan body.
+                    if (provider != "gemini" and code == 200
+                            and isinstance(parsed, dict)
+                            and isinstance(parsed.get("error"), dict)):
+                        error = parsed["error"]
+                        err_code = error.get("code")
+                        if isinstance(err_code, int) and 400 <= err_code < 600:
+                            code = err_code
+                        elif ("rate" in str(error.get("type", "")).lower()
+                              or "429" in str(error.get("message", ""))):
+                            code = 429
+                        else:
+                            code = 502
+                    if code == 429:
+                        self.limiter.cooldown(15, key=key)
+                        last = RuntimeError("rate limited (429)")
+                        time.sleep(5 * (attempt + 1))
+                        continue
+                    if (code == 400 and provider != "gemini"
+                            and "response_format" in body and not rf_retry):
+                        # Sebagian gateway menolak response_format; coba tanpa.
+                        del body["response_format"]
+                        rf_retry = True
+                        last = RuntimeError(
+                            "Gateway menolak response_format; mencoba tanpa mode JSON.")
+                        continue
+                    if code >= 400:
+                        raise RuntimeError(f"Glossary AI HTTP {code}")
+                    # Rekonsiliasi usage SEBELUM parsing konten: HTTP 200 berarti
                 # penyedia sudah menagih, apa pun hasil parsing JSON-nya.
                 # Kegagalan pencatatan dilog via status callback, tidak
                 # disembunyikan dengan except-pass.
@@ -208,6 +248,10 @@ class GlossaryAIClient:
     def discover(self, chapter_text: str, chapter_index: int) -> tuple[list[dict], int, int]:
         """Ekstraksi terminologi dari teks satu bab. Kembalikan (terms, in, out)."""
         text = chapter_text[:DISCOVERY_MAX_CHARS]
+        # v2.5.2: potong pada batas paragraf terdekat agar tidak memenggal
+        # paragraf/kata terakhir (sebelumnya indeks karakter mentah).
+        if len(chapter_text) > DISCOVERY_MAX_CHARS and "\n\n" in text:
+            text = text.rsplit("\n\n", 1)[0]
         paras = [p.strip() for p in text.split("\n\n") if p.strip()]
         body = "\n\n".join(f"[P{i+1}] {p}" for i, p in enumerate(paras))
         prompt = (DISCOVERY_INSTRUCTIONS +
@@ -315,13 +359,18 @@ def validate_candidate(term: dict, chapter_text: str, seen: set[str],
     bad_names = [w for w in _name_tokens(src)
                  if w.casefold() not in prop_toks
                  and not (_EN_ID_MAP.get(w.casefold(), "") and
-                          _EN_ID_MAP[w.casefold()] in prop.casefold())]
+                          # v2.5.2: cocokkan level token, bukan substring mentah
+                          # ("tn"/"dr" dulu lolos di kata acak seperti "indra").
+                          set(_tok(_EN_ID_MAP[w.casefold()])) <= prop_toks)]
     if bad_names:
         findings.append(LocalFinding("R2", f"token nama hilang/berubah: {bad_names}"))
 
     # R3: tanpa tambahan tak didukung
     src_toks = set(_tok(src))
-    allowed = " ".join(v for k, v in _EN_ID_MAP.items() if k in src_toks)
+    allowed = set()
+    for k, v in _EN_ID_MAP.items():
+        if k in src_toks:
+            allowed.update(_tok(v))  # v2.5.2: himpunan token, bukan string gabungan
     bad_toks = [t for t in _tok(prop)
                 if t not in _ID_STOPWORDS and t not in src_toks and t not in allowed]
     if bad_toks:
@@ -347,8 +396,8 @@ def validate_candidate(term: dict, chapter_text: str, seen: set[str],
         wl = w.casefold()
         if wl in [p.casefold() for p in prop_words]:
             continue
-        if _EN_ID_MAP.get(wl, "") and _EN_ID_MAP[wl] in prop.casefold():
-            continue
+        if _EN_ID_MAP.get(wl, "") and set(_tok(_EN_ID_MAP[wl])) <= set(_tok(prop)):
+            continue  # v2.5.2: cocok level token (dulu substring longgar)
         for p in prop_words:
             r = SequenceMatcher(None, wl, p.casefold()).ratio()
             if 0.6 < r < 1.0:
@@ -614,6 +663,8 @@ def run_chapter_discovery(chapter_index: int, units, memory: BookMemory,
             origin=decision.origin if decision.approved else "pending",
             source_chapter=chapter_index,
             evidence=(t.get("supporting_text") or "")[:300],
+            # v2.6.0: saran koreksi verifier disimpan, tidak pernah auto-apply.
+            suggested_fix=(verdict.get("corrected_translation") or "").strip(),
         )
         if decision.status == "rejected":
             memory.rejected_terms.append(term.normalized())

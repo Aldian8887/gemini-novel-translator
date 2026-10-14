@@ -11,6 +11,7 @@ from .diagnostics import FailureLogger
 from .epub import EpubBook
 from .errors import CacheError, InvalidEpub, InvalidResponse, Paused, RepackRequired
 from .gemini_client import GeminiTranslator
+from .openai_client import OpenAICompatibleTranslator
 from .metrics import ProgressMetrics
 from .token_budget import PromptBuilder, TokenEstimator, TokenPacker, split_batch, text_tokens
 from .models import (TranslationOptions, TranslationResult, canonical, digest,
@@ -19,8 +20,38 @@ from .rate_limit import RateLimiter
 from .storage import TranslationCache, atomic_bytes, check_cancel, workspace_lock
 
 
+def _inheritance_source(prev, ch_job_id, config_id):
+    """Tentukan namespace lama yang boleh diwariskan, atau None.
+
+    v2.6.0 guard isolasi: warisan HANYA bila namespace berubah karena glossary
+    (config_id non-glossary identik). Bila model/style/domain/skill/provider
+    berubah, config_id ikut berubah -> retranslate penuh (kontrak pipeline:
+    "ganti style/config tetap menerjemahkan ulang").
+    """
+    if not prev:
+        return None
+    if prev.get("job_id") == ch_job_id:
+        return None  # namespace sama -> jalur load normal
+    if prev.get("config_id") != config_id:
+        return None  # config berubah -> jangan wariskan antar-model/style
+    return prev.get("job_id")
+
+
 def translate_novel(input_path: Path, output_base: Path, options: TranslationOptions,
-                    progress=None, translator_factory=GeminiTranslator, cancel_event=None, metrics=None):
+                    progress=None, translator_factory=GeminiTranslator, cancel_event=None, metrics=None,
+                    glossary_ai_factory=None):
+    """Terjemahkan EPUB. Bila options.auto_glossary aktif: mode kronologis v1.
+
+    glossary_ai_factory: injeksi untuk pengujian — callable(options, limiter,
+    cancel_event, status) -> objek dengan .discover()/.verify(). Default:
+    GlossaryAIClient (API nyata).
+    """
+    # v2.5.2: pilih factory otomatis berdasar provider bila pemanggil memakai
+    # default (GeminiTranslator) tanpa injeksi manual — mencegah translator
+    # salah sasaran endpoint saat options.provider == "openai".
+    if (translator_factory is GeminiTranslator
+            and getattr(options, "provider", "gemini") == "openai"):
+        translator_factory = OpenAICompatibleTranslator
     metrics = metrics or getattr(progress, "metrics", None)
     options.validate()
     source = Path(input_path).resolve()
@@ -38,6 +69,11 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
         raise InvalidEpub("Tidak ada teks Inggris yang dapat diterjemahkan; EPUB mungkin sudah berbahasa Indonesia.")
     settings = options.settings()
     job_id = digest(book.source_hash + canonical(settings))
+    # v2.6.0: identitas config NON-glossary untuk guard selective re-translation.
+    # Berubah saat model/style/domain/skill/provider berubah (wajib retranslate
+    # penuh); stabil saat hanya glossary yang berubah (warisan diizinkan).
+    config_id = digest(canonical(
+        {k: v for k, v in settings.items() if k != "glossary"}))
     root = Path(options.cache_dir or source.parent / ".novel_translator_cache").resolve()
     runs = {r.id: r for r in book.runs}
     fingerprints = {}
@@ -56,7 +92,43 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
             # v2.3.0: mode generate ulang mengabaikan cache terjemahan lama
             # (hasil baru tetap ditulis menimpa baris yang sama), agar buku
             # yang sama bisa dibandingkan antar pengaturan/domain.
-            saved = {} if options.ignore_cache else cache.load(job_id, fingerprints)
+            #
+            # Book Memory v1: mode auto_glossary memakai namespace cache PER BAB
+            # (chapter_job_id) agar glossary kronologis deterministik. Bab yang
+            # sudah published dimuat dari cache babnya masing-masing (resume).
+            _v1 = None
+            if options.auto_glossary:
+                from .book_memory import (BookMemoryStore, compute_book_id,
+                                           glossary_fingerprint,
+                                           split_inherited_units)
+                from . import glossary_auto as _ga
+                _v1_store = BookMemoryStore()
+                _v1_book_id = compute_book_id(source)
+                _v1_mem = _v1_store.load(_v1_book_id)
+                if not _v1_mem.title:
+                    _v1_mem.title = book.title
+                    _v1_store.save(_v1_mem)
+                from types import SimpleNamespace
+                _v1 = SimpleNamespace(store=_v1_store, book_id=_v1_book_id,
+                                      mem=_v1_mem, ga=_ga,
+                                      chapters=_ga.group_chapters(book))
+            if _v1 is None:
+                saved = {} if options.ignore_cache else cache.load(job_id, fingerprints)
+            else:
+                saved = {}
+                if not options.ignore_cache:
+                    for _ch_idx, _ch_units in _v1.chapters:
+                        # Namespace memakai glossary efektif (manual menang);
+                        # job_id basis sudah membedakan config, hash glossary
+                        # membedakan perubahan glossary. Tidak memakai
+                        # translation_progress sebagai gate: kecocokan ditentukan
+                        # oleh namespace itu sendiri.
+                        _ch_gl = _ga.effective_chapter_glossary(
+                            _v1.mem, _ch_idx, options.glossary)
+                        _ch_fps = {r.id: fingerprints[r.id]
+                                   for u in _ch_units for r in u.runs}
+                        saved.update(cache.load(
+                            _v1.ga.chapter_job_id(job_id, _ch_idx, _ch_gl), _ch_fps))
             targets = {}
             invalid_cache = 0
             for rid, text in saved.items():
@@ -92,12 +164,19 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
 
             emit_metrics()
             translator = None
+            v1_translators: list = []  # translator per bab (mode v1) untuk ditutup
             try:
-                if pending:
-                    check_cancel(cancel_event)
-                    translator = translator_factory(options, limiter, cancel_event=cancel_event, status=notify)
+                def _new_translator(use_options):
+                    tr = translator_factory(use_options, limiter, cancel_event=cancel_event,
+                                            status=notify)
+                    v1_translators.append(tr)
+                    return tr
 
-                def validate_batch(batch):
+                if pending and _v1 is None:
+                    check_cancel(cancel_event)
+                    translator = _new_translator(options)
+
+                def validate_batch(batch, translator):
                     # v2.2.4 salvage: terima potongan valid dari respons yang
                     # tidak sempurna; hanya potongan rusak/hilang yang diminta
                     # ulang. Translator tanpa API parsial (fake/factory lama)
@@ -127,36 +206,41 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
                             bad_units.append(unit.subset(bad_runs))
                     return good, bad_units, issues
 
-                def commit(translated):
-                    nonlocal done
-                    # Only coordinator writes translations; each successful
-                    # response gets a durable transaction before any UI progress.
-                    if set(translated).intersection(targets):
-                        raise InvalidResponse("Scheduler mencoba menimpa potongan yang sudah tersimpan.")
-                    cache.save_batch(job_id, fingerprints, translated)
-                    targets.update(translated)
-                    done = len(targets)
-                    meter.commit(translated)
-                    cache.state(job_id, book.source_hash, settings, "running", done, total)
-                    notify(f"Tersimpan {done}/{total} potongan teks.")
+                def make_commit(use_job_id):
+                    def commit(translated):
+                        nonlocal done
+                        # Only coordinator writes translations; each successful
+                        # response gets a durable transaction before any UI progress.
+                        if set(translated).intersection(targets):
+                            raise InvalidResponse("Scheduler mencoba menimpa potongan yang sudah tersimpan.")
+                        cache.save_batch(use_job_id, fingerprints, translated)
+                        targets.update(translated)
+                        done = len(targets)
+                        meter.commit(translated)
+                        cache.state(use_job_id, book.source_hash, settings, "running", done, total)
+                        notify(f"Tersimpan {done}/{total} potongan teks.")
+                    return commit
 
-                if pending:
-                    builder = getattr(translator, "builder", None) or PromptBuilder(options)
-                    estimator = getattr(translator, "estimator", None) or TokenEstimator(cache, options.model)
-                    packer = TokenPacker(options, estimator, controller, builder)
-                    pending, recoveries = deque(pending), deque()
+                def drain(work_units, packer, translator, commit):
+                    """Work loop yang diekstrak: habiskan work_units via workers.
+
+                    Dipakai jalur legacy (sekali jalan) dan jalur v1 (per bab).
+                    Publication barrier v1 berjalan di koordinator antar-bab,
+                    sehingga worker tidak pernah melintasi batas bab.
+                    """
+                    pending_q, recoveries = deque(work_units), deque()
                     failure = None
                     active = {}
                     retried = set()  # frozenset id-run yang sudah memakai jatah 1x retry urutan-dibalik
                     with ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="gemini") as pool:
-                        while pending or recoveries or active:
+                        while pending_q or recoveries or active:
                             if cancel_event is not None and cancel_event.is_set() and failure is None:
                                 failure = Paused("Dijeda oleh pengguna. Seluruh hasil valid request aktif disimpan.")
                                 limiter.halt(str(failure))
-                            while failure is None and len(active) < controller.snapshot()["workers_limit"] and (pending or recoveries):
+                            while failure is None and len(active) < controller.snapshot()["workers_limit"] and (pending_q or recoveries):
                                 try:
-                                    batch = recoveries.popleft() if recoveries else packer.take(pending)
-                                    active[pool.submit(validate_batch, batch)] = batch
+                                    batch = recoveries.popleft() if recoveries else packer.take(pending_q)
+                                    active[pool.submit(validate_batch, batch, translator)] = batch
                                 except Exception as exc:
                                     failure = exc
                                     limiter.halt(str(exc))
@@ -188,7 +272,7 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
                                         retried.add(frozenset(r.id for u in batch for r in u.runs))
                                         controller.retry()
                                         flipped = list(reversed(batch))
-                                        active[pool.submit(validate_batch, flipped)] = flipped
+                                        active[pool.submit(validate_batch, flipped, translator)] = flipped
                                         notify("Respons tidak valid (kesalahan mekanis); mengulang batch dengan urutan unit dibalik sebelum dibelah.")
                                     else:
                                         parts = split_batch(batch)
@@ -249,7 +333,7 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
                                                 retried.add(key)
                                                 controller.retry()
                                                 flipped = list(reversed(bad_units))
-                                                active[pool.submit(validate_batch, flipped)] = flipped
+                                                active[pool.submit(validate_batch, flipped, translator)] = flipped
                                                 notify("Respons tidak valid (kesalahan mekanis); mengulang sisa batch dengan urutan unit dibalik sebelum dibelah.")
                                             else:
                                                 parts = split_batch(bad_units)
@@ -265,6 +349,146 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
                     # were committed even if another worker paused/failed first.
                     if failure is not None:
                         raise failure
+
+                def _run_chapters_v1():
+                    """Loop kronologis per bab + publication barrier.
+
+                    Worker paralel hanya di DALAM bab. Antar-bab, koordinator
+                    menjalankan discovery -> validasi -> verifikasi -> approval
+                    sebelum bab berikutnya dimulai (deterministik).
+                    """
+                    nonlocal done
+                    from dataclasses import replace as _replace
+                    ga = _v1.ga
+                    mem, store = _v1.mem, _v1.store
+                    _ai_factory = glossary_ai_factory or ga.GlossaryAIClient
+                    ai_client = _ai_factory(options, limiter, cancel_event, notify)
+                    n_chapters = len(_v1.chapters)
+                    # Auto Safe mensyaratkan AI verification; tanpanya paksa review_first.
+                    policy = (options.approval_policy if options.auto_verify
+                              else "review_first")
+                    for ch_idx, ch_units in _v1.chapters:
+                        check_cancel(cancel_event)
+                        # Glossary kronologis: auto-approved dari bab < ch_idx,
+                        # lalu MANUAL selalu menang (termasuk normalisasi kapital).
+                        ch_glossary = ga.effective_chapter_glossary(
+                            mem, ch_idx, options.glossary)
+                        ch_options = _replace(options, glossary=ch_glossary)
+                        # Namespace cache mencakup hash glossary efektif (P1):
+                        # perubahan glossary -> namespace baru, tidak diam-diam
+                        # memakai cache lama yang tidak kompatibel.
+                        ch_job_id = ga.chapter_job_id(job_id, ch_idx, ch_glossary)
+                        ch_fps = {r.id: fingerprints[r.id]
+                                  for u in ch_units for r in u.runs}
+                        # Muat cache job-ini (kecuali ignore_cache). Kelengkapan
+                        # ditentukan oleh cache job, BUKAN progress global —
+                        # sehingga ganti style/config tetap menerjemahkan ulang.
+                        if not options.ignore_cache:
+                            for rid, text in cache.load(ch_job_id, ch_fps).items():
+                                try:
+                                    targets[rid] = validate_text(runs[rid], text)
+                                except InvalidResponse:
+                                    pass
+                            # v2.6.0 selective re-translation: bila namespace bab
+                            # berubah HANYA karena glossary (guard config_id),
+                            # wariskan terjemahan unit tak-terdampak dari
+                            # namespace lama — API hanya mengulang unit yang
+                            # benar-benar mengandung istilah berubah.
+                            _prev = (mem.chapter_namespaces or {}).get(str(ch_idx))
+                            _src_job = _inheritance_source(_prev, ch_job_id, config_id)
+                            if _src_job:
+                                _old_targets = cache.load(_src_job, ch_fps)
+                                # v2.6.0: bedakan "snapshot hilang" (None) dari
+                                # "glossary lama memang kosong" ({} valid).
+                                _gh = (_prev or {}).get("ghash")
+                                _old_glossary = (mem.glossary_snapshots or {}).get(_gh) \
+                                    if _gh else None
+                                if _old_targets and _old_glossary is not None:
+                                    _inh, _aff_runs = split_inherited_units(
+                                        _old_glossary, ch_glossary, ch_units,
+                                        _old_targets)
+                                    _valid = {}
+                                    for _rid, _txt in _inh.items():
+                                        if _rid in targets:
+                                            continue  # jangan timpa (guard InvalidResponse)
+                                        try:
+                                            targets[_rid] = validate_text(
+                                                runs[_rid], _txt)
+                                            _valid[_rid] = targets[_rid]
+                                        except InvalidResponse:
+                                            pass  # rusak -> terjemahkan ulang
+                                    if _valid:
+                                        cache.save_batch(ch_job_id, ch_fps, _valid)
+                                        meter.inherit(_valid.keys())
+                                        done = len(targets)
+                                        cache.state(ch_job_id, book.source_hash,
+                                                    settings, "running", done, total)
+                                        notify(f"Bab {ch_idx}: {len(_valid)} unit "
+                                               f"diwariskan dari terjemahan sebelumnya; "
+                                               f"{len(_aff_runs)} run diterjemahkan ulang.")
+                        ch_pending = [u.subset([r for r in u.runs if r.id not in targets])
+                                      for u in ch_units
+                                      if any(r.id not in targets for r in u.runs)]
+                        notify(f"Bab {ch_idx}/{n_chapters}: {len(ch_pending)} unit pending, "
+                               f"{len(ch_glossary)} istilah glossary.")
+                        if ch_pending:
+                            ch_translator = _new_translator(ch_options)
+                            try:
+                                # v2.6.0: injeksi catatan karakter per bab (opt-in,
+                                # anti-spoiler via notes_for_chapter); "" bila OFF
+                                # sehingga prompt byte-identik dengan semula.
+                                ch_notes = (mem.character_block(chapter=ch_idx)
+                                            if options.character_notes else "")
+                                ch_packer = TokenPacker(
+                                    ch_options, TokenEstimator(cache, ch_options.model),
+                                    controller, PromptBuilder(ch_options,
+                                                              chapter_notes=ch_notes))
+                                drain(ch_pending, ch_packer, ch_translator,
+                                      make_commit(ch_job_id))
+                            finally:
+                                # v2.5.2: tutup pool koneksi segera setelah bab
+                                # selesai — sebelumnya translator per bab menumpuk
+                                # terbuka hingga seluruh buku selesai.
+                                try:
+                                    ch_translator.close()
+                                except Exception:
+                                    pass
+                        # ---- PUBLICATION BARRIER ----
+                        # Idempoten via discovery_log: bab yang sudah published
+                        # dilewati tanpa API call. ignore_cache memaksa discovery
+                        # ulang dengan menghapus penanda published bab ini.
+                        if options.ignore_cache:
+                            _lk = str(ch_idx)
+                            if mem.discovery_log.get(_lk, {}).get("status") == "published":
+                                del mem.discovery_log[_lk]
+                        res = ga.run_chapter_discovery(
+                            ch_idx, ch_units, mem, store, ai_client,
+                            policy, options.auto_verify, cancel_event,
+                            manual_glossary=options.glossary)
+                        mem.translation_progress = max(mem.translation_progress, ch_idx)
+                        # v2.6.0: catat namespace + snapshot glossary bab ini
+                        # untuk selective re-translation di run berikutnya.
+                        _ghash = glossary_fingerprint(ch_glossary)
+                        mem.chapter_namespaces[str(ch_idx)] = {
+                            "job_id": ch_job_id, "ghash": _ghash,
+                            "config_id": config_id}
+                        if _ghash not in mem.glossary_snapshots:
+                            mem.glossary_snapshots[_ghash] = dict(ch_glossary)
+                        store.save(mem)
+                        notify(f"Bab {ch_idx} terbit: {res.discovered} istilah ditemukan "
+                               f"({res.auto_approved} auto-approved, {res.pending} pending review).")
+
+                if _v1 is None:
+                    # Jalur legacy: perilaku identik seperti sebelumnya.
+                    if pending:
+                        builder = (getattr(translator, "builder", None)
+                                   or PromptBuilder(options))
+                        estimator = (getattr(translator, "estimator", None)
+                                     or TokenEstimator(cache, options.model))
+                        packer = TokenPacker(options, estimator, controller, builder)
+                        drain(pending, packer, translator, make_commit(job_id))
+                else:
+                    _run_chapters_v1()
                 check_cancel(cancel_event)
                 if set(targets) != set(runs):
                     raise InvalidResponse("Cakupan terjemahan belum lengkap.")
@@ -313,5 +537,10 @@ def translate_novel(input_path: Path, output_base: Path, options: TranslationOpt
                 controller.persist()  # G2 (T-GEMINI-2): force-persist state tuning saat pause/selesai/error
                 if translator is not None:
                     translator.close()
+                for _tr in v1_translators:
+                    try:
+                        _tr.close()
+                    except Exception:
+                        pass
     except Paused as exc:
         return TranslationResult(False, book.title, total, done, requests, str(exc), job_id=job_id)
